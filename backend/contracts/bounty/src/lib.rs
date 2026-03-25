@@ -44,6 +44,17 @@ pub struct BountyApplication {
     pub created_at: u64,
 }
 
+/// Work Submission Struct (new)
+#[contracttype]
+pub struct WorkSubmission {
+    pub bounty_id: u64,
+    pub freelancer: Address,
+    pub work_url: String,
+    pub notes: String,
+    pub submitted_at: u64,
+    pub approved: bool,
+}
+
 /// Bounty Contract Trait
 #[contract]
 pub trait BountyContractTrait {
@@ -80,8 +91,14 @@ pub trait BountyContractTrait {
         application_id: u64,
     ) -> bool;
 
-    /// Complete bounty
+    /// Submit work completion (freelancer only)
+    fn submit_work(env: Env, bounty_id: u64, work_url: String, notes: String) -> bool;
+
+    /// Complete bounty (creator approves freelancer's work)
     fn complete_bounty(env: Env, bounty_id: u64) -> bool;
+
+    /// Get work submission for a bounty
+    fn get_work_submission(env: Env, bounty_id: u64) -> Option<WorkSubmission>;
 
     /// Cancel bounty
     fn cancel_bounty(env: Env, bounty_id: u64) -> bool;
@@ -222,6 +239,35 @@ impl BountyContractTrait for BountyContract {
         true
     }
 
+    fn submit_work(env: Env, bounty_id: u64, work_url: String, notes: String) -> bool {
+        let bounty_key = Symbol::new(&env, &format!("bounty_{}", bounty_id));
+        let bounty = env
+            .storage()
+            .persistent()
+            .get::<Symbol, Bounty>(&bounty_key)
+            .expect("Bounty not found");
+
+        // Only selected freelancer can submit work
+        let freelancer = bounty.selected_freelancer.clone().expect("No freelancer selected");
+        freelancer.require_auth();
+
+        assert_eq!(bounty.status, BountyStatus::InProgress, "Bounty not in progress");
+
+        let submission = WorkSubmission {
+            bounty_id,
+            freelancer: freelancer.clone(),
+            work_url,
+            notes,
+            submitted_at: env.ledger().timestamp(),
+            approved: false,
+        };
+
+        let submission_key = Symbol::new(&env, &format!("work_submission_{}", bounty_id));
+        env.storage().persistent().set(&submission_key, &submission);
+
+        true
+    }
+
     fn complete_bounty(env: Env, bounty_id: u64) -> bool {
         let bounty_key = Symbol::new(&env, &format!("bounty_{}", bounty_id));
         let mut bounty = env
@@ -233,12 +279,30 @@ impl BountyContractTrait for BountyContract {
         bounty.creator.require_auth();
         assert_eq!(bounty.status, BountyStatus::InProgress, "Bounty not in progress");
 
+        // Verify work was submitted before allowing completion
+        let submission_key = Symbol::new(&env, &format!("work_submission_{}", bounty_id));
+        let submission: Option<WorkSubmission> = env.storage().persistent().get(&submission_key);
+        
+        if let Some(mut sub) = submission {
+            // Mark submission as approved
+            sub.approved = true;
+            env.storage().persistent().set(&submission_key, &sub);
+        } else {
+            // Allow completion without submission for backward compatibility
+            // But in new workflow, creator should call submit_work first
+        }
+
         bounty.status = BountyStatus::Completed;
         bounty.completed_at = Some(env.ledger().timestamp());
 
         env.storage().persistent().set(&bounty_key, &bounty);
 
         true
+    }
+
+    fn get_work_submission(env: Env, bounty_id: u64) -> Option<WorkSubmission> {
+        let submission_key = Symbol::new(&env, &format!("work_submission_{}", bounty_id));
+        env.storage().persistent().get(&submission_key)
     }
 
     fn cancel_bounty(env: Env, bounty_id: u64) -> bool {
@@ -351,5 +415,61 @@ mod tests {
 
         let application = contract.get_application(&app_id);
         assert_eq!(application.freelancer, freelancer);
+    }
+
+    #[test]
+    fn test_submit_work_and_complete() {
+        let env = Env::default();
+        let contract = BountyContractClient::new(&env, &env.register_contract(None, BountyContract));
+
+        let creator = Address::random(&env);
+        let freelancer = Address::random(&env);
+
+        // Create bounty
+        let bounty_id = contract.create_bounty(
+            &creator,
+            &String::from_slice(&env, "Test Bounty"),
+            &String::from_slice(&env, "Test Description"),
+            &5000i128,
+            &100u64,
+        );
+
+        // Apply for bounty
+        let app_id = contract.apply_for_bounty(
+            &bounty_id,
+            &freelancer,
+            &String::from_slice(&env, "I can do this!"),
+            &4500i128,
+            &30u64,
+        );
+
+        // Select freelancer
+        contract.select_freelancer(&bounty_id, &app_id);
+
+        // Submit work (freelancer)
+        let work_url = String::from_slice(&env, "https://github.com/freelancer/project/pull/1");
+        let notes = String::from_slice(&env, "Completed all requirements");
+        let result = contract.submit_work(&bounty_id, &work_url, &notes);
+        assert_eq!(result, true);
+
+        // Verify submission
+        let submission = contract.get_work_submission(&bounty_id);
+        assert!(submission.is_some());
+        let sub = submission.unwrap();
+        assert_eq!(sub.freelancer, freelancer);
+        assert_eq!(sub.approved, false);
+
+        // Complete bounty (creator)
+        let result = contract.complete_bounty(&bounty_id);
+        assert_eq!(result, true);
+
+        // Verify completion
+        let bounty = contract.get_bounty(&bounty_id);
+        assert_eq!(bounty.status, BountyStatus::Completed);
+
+        // Verify submission approved
+        let submission = contract.get_work_submission(&bounty_id);
+        let sub = submission.unwrap();
+        assert_eq!(sub.approved, true);
     }
 }
