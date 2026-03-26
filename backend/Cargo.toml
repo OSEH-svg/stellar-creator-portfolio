@@ -46,6 +46,9 @@ anyhow = "1.0"
 futures = "0.3"
 dotenvy = "0.15"
 
+# HTTP client (indexer polls Horizon/Soroban RPC)
+reqwest = { version = "0.12", features = ["json"] }
+
 # Testing
 tokio-test = "0.4"
 
