@@ -7,6 +7,100 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
+pub mod middleware;
+use middleware::{AuthMiddleware, AuthMiddlewareInner};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessClaims {
+    pub sub: String,
+    pub family_id: uuid::Uuid,
+    pub exp: i64,
+    pub iat: i64,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AuthError {
+    #[error("Missing or invalid Authorization header")]
+    MissingHeader,
+    #[error("Invalid JWT token")]
+    InvalidToken(#[from] jsonwebtoken::errors::Error),
+}
+
+impl actix_web::ResponseError for AuthError {
+    fn error_response(&self) -> HttpResponse {
+        let response: ApiResponse<serde_json::Value> = ApiResponse::err(self.to_string());
+        HttpResponse::Unauthorized().json(response)
+    }
+}
+
+async fn get_claims(req: &actix_web::HttpRequest) -> Result<AccessClaims, AuthError> {
+    let token = req.headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .ok_or(AuthError::MissingHeader)?;
+
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let mut validation = Validation::default();
+    validation.validate_exp = true;
+    let claims = decode::<AccessClaims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &validation,
+    )?
+    .claims;
+
+    Ok(claims)
+}
+
+use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
+use actix_web::Error;
+use chrono::{DateTime, Utc};
+use jsonwebtoken::{decode, DecodingKey, Validation};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessClaims {
+    pub sub: String,
+    pub family_id: uuid::Uuid,
+    pub exp: i64,
+    pub iat: i64,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AuthError {
+    #[error("Missing or invalid Authorization header")]
+    MissingHeader,
+    #[error("Invalid JWT token")]
+    InvalidToken(#[from] jsonwebtoken::errors::Error),
+}
+
+impl actix_web::ResponseError for AuthError {
+    fn error_response(&self) -> HttpResponse {
+        let response: ApiResponse<serde_json::Value> = ApiResponse::err(self.to_string());
+        HttpResponse::Unauthorized().json(response)
+    }
+}
+
+async fn get_claims(req: &actix_web::HttpRequest) -> Result<AccessClaims, AuthError> {
+    let token = req.headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .ok_or(AuthError::MissingHeader)?;
+
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let mut validation = Validation::default();
+    validation.validate_exp = true;
+    let claims = decode::<AccessClaims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &validation,
+    )?
+    .claims;
+
+    Ok(claims)
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 pub struct BountyRequest {
     /// Stellar address of the bounty creator
