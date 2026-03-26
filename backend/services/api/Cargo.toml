@@ -28,3 +28,4 @@ redis.workspace = true
 deadpool-redis.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
+uuid = { version = "1.10", features = ["v4", "serde"] }

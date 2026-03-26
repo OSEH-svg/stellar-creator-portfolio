@@ -1,11 +1,14 @@
 use actix_cors::Cors;
-use actix_web::{middleware, web, App, HttpResponse, HttpServer};
+use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer};
 use deadpool_redis::{redis::AsyncCommands, Config, Pool, Runtime};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber;
 #[derive(Clone, Serialize, Deserialize, Debug)]
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+
+mod custom_middleware;
+use custom_middleware::{RequestId, get_request_id};
 
 // ── Request / Response types ─────────────────────────────────────────────────
 
@@ -68,11 +71,15 @@ impl<T: ToSchema> ApiResponse<T> {
     get, path = "/health",
     responses((status = 200, description = "Service is healthy"))
 )]
-async fn health() -> HttpResponse {
+async fn health(req: HttpRequest) -> HttpResponse {
+    let request_id = get_request_id(&req).unwrap_or_else(|| "unknown".to_string());
+    tracing::info!(request_id = %request_id, "Health check requested");
+    
     HttpResponse::Ok().json(serde_json::json!({
         "status": "healthy",
         "service": "stellar-api",
-        "version": "0.1.0"
+        "version": "0.1.0",
+        "request_id": request_id
     }))
 }
 
@@ -85,8 +92,10 @@ async fn health() -> HttpResponse {
         (status = 400, description = "Invalid request body"),
     )
 )]
-async fn create_bounty(body: web::Json<BountyRequest>) -> HttpResponse {
-    tracing::info!("Creating bounty: {:?}", body.title);
+async fn create_bounty(req: HttpRequest, body: web::Json<BountyRequest>) -> HttpResponse {
+    let request_id = get_request_id(&req).unwrap_or_else(|| "unknown".to_string());
+    tracing::info!(request_id = %request_id, title = %body.title, "Creating bounty");
+    
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
         serde_json::json!({
             "bounty_id": 1,
@@ -127,14 +136,19 @@ async fn list_bounties() -> HttpResponse {
         (status = 404, description = "Bounty not found"),
     )
 )]
-async fn get_bounty(path: web::Path<u64>) -> HttpResponse {
+async fn get_bounty(
+    req: HttpRequest,
+    path: web::Path<u64>,
+    redis: web::Data<Pool>,
+) -> HttpResponse {
+    let request_id = get_request_id(&req).unwrap_or_else(|| "unknown".to_string());
     let bounty_id = path.into_inner();
     let cache_key = format!("api:bounty:{}", bounty_id);
 
     if let Ok(mut conn) = redis.get().await {
         if let Ok(cached_data) = conn.get::<_, String>(&cache_key).await {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cached_data) {
-                tracing::debug!("Cache hit for {}", cache_key);
+                tracing::debug!(request_id = %request_id, "Cache hit for {}", cache_key);
                 return HttpResponse::Ok().json(ApiResponse::ok(parsed, None));
             }
         }
@@ -205,10 +219,15 @@ async fn register_freelancer(body: web::Json<FreelancerRegistration>) -> HttpRes
     responses((status = 200, description = "Paginated list of freelancers"))
 )]
 async fn list_freelancers(
+    req: HttpRequest,
     query: web::Query<std::collections::HashMap<String, String>>,
     redis: web::Data<Pool>,
 ) -> HttpResponse {
+    let request_id = get_request_id(&req).unwrap_or_else(|| "unknown".to_string());
     let discipline = query.get("discipline").cloned().unwrap_or_default();
+    
+    tracing::info!(request_id = %request_id, discipline = %discipline, "Listing freelancers");
+    
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
         serde_json::json!({ "freelancers": [], "total": 0, "filters": { "discipline": discipline } }),
         None,
@@ -225,14 +244,19 @@ async fn list_freelancers(
         (status = 404, description = "Freelancer not found"),
     )
 )]
-async fn get_freelancer(path: web::Path<String>) -> HttpResponse {
+async fn get_freelancer(
+    req: HttpRequest,
+    path: web::Path<String>,
+    redis: web::Data<Pool>,
+) -> HttpResponse {
+    let request_id = get_request_id(&req).unwrap_or_else(|| "unknown".to_string());
     let address = path.into_inner();
     let cache_key = format!("api:freelancer:{}", address);
 
     if let Ok(mut conn) = redis.get().await {
         if let Ok(cached_data) = conn.get::<_, String>(&cache_key).await {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cached_data) {
-                tracing::debug!("Cache hit for {}", cache_key);
+                tracing::debug!(request_id = %request_id, "Cache hit for {}", cache_key);
                 return HttpResponse::Ok().json(ApiResponse::ok(parsed, None));
             }
         }
@@ -352,6 +376,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(redis_pool.clone()))
+            .wrap(RequestId)  // Request ID middleware - must be early in chain
             .wrap(middleware::Logger::default())
             .wrap(middleware::NormalizePath::trim())
             // Swagger UI at /swagger-ui/
