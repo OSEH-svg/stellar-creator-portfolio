@@ -106,6 +106,11 @@ export function Header() {
             <Link href="/about" className="px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors rounded-lg hover:bg-secondary/50">
               About
             </Link>
+            {session && (
+              <Link href="/disputes" className="px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors rounded-lg hover:bg-secondary/50">
+                Disputes
+              </Link>
+            )}
           </nav>
 
           {/* Right Actions */}
@@ -198,6 +203,54 @@ export function Header() {
           onSignOut={handleSignOut}
           themeToggleSlot={mounted ? themeToggle : null}
         />
+        {/* Mobile Navigation */}
+        {isMenuOpen && (
+          <nav className="md:hidden pb-4 border-t border-border">
+            <Link href="/" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+              Home
+            </Link>
+            <Link href="/creators" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+              Creators
+            </Link>
+            <Link href="/freelancers" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+              Hire
+            </Link>
+            <Link href="/bounties" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+              Bounties
+            </Link>
+            <Link href="/about" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+              About
+            </Link>
+            {session && (
+              <Link href="/disputes" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+                Disputes
+              </Link>
+            )}
+            
+            {session ? (
+              <>
+                <Link href="/dashboard" className="block px-4 py-2 text-sm font-medium text-foreground hover:text-primary transition-colors">
+                  Dashboard
+                </Link>
+                <button
+                  onClick={handleSignOut}
+                  className="w-full text-left px-4 py-2 text-sm font-medium text-destructive hover:text-destructive transition-colors"
+                >
+                  Sign Out
+                </button>
+              </>
+            ) : (
+              <>
+                <Link href="/auth/login" className="block px-4 py-2 text-sm font-medium text-primary hover:text-primary transition-colors">
+                  Sign In
+                </Link>
+                <Link href="/auth/register" className="block px-4 py-2 text-sm font-medium text-primary hover:text-primary transition-colors">
+                  Sign Up
+                </Link>
+              </>
+            )}
+          </nav>
+        )}
       </div>
     </header>
   );
