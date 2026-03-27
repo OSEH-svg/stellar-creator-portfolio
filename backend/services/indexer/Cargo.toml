@@ -19,5 +19,5 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
 sqlx.workspace = true
-thiserror.workspace = true
-backoff = { version = "0.4", features = ["tokio"] }
+reqwest.workspace = true
+stellar-discovery = { path = "../discovery" }
