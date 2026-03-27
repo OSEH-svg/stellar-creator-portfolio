@@ -956,7 +956,7 @@ async fn release_escrow(path: web::Path<u64>, pool: web::Data<PgPool>) -> Result
 pub struct ApiDoc;
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -976,6 +976,8 @@ async fn main() -> std::io::Result<()> {
     let db_pool = PgPool::connect(&database_url)
         .await
         .unwrap_or_else(|error| panic!("Failed to connect to PostgreSQL using DATABASE_URL: {error}"));
+
+    tracing::info!("Connected to database");
 
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let cfg = Config::from_url(redis_url);
@@ -1079,3 +1081,4 @@ mod tests {
         );
     }
 }
+
