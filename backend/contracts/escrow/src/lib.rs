@@ -71,6 +71,7 @@ pub enum DataKey {
     Arbitrator,
     Dispute(u64),
     Evidence(u64, u32),
+    PartialRefundBalance(u64),
 }
 
 #[contract]
@@ -253,6 +254,118 @@ impl EscrowContract {
             .set(&DataKey::Escrow(escrow_id), &escrow);
 
         true
+    }
+
+    /// Performs a partial refund of escrowed funds.
+    /// Only payer or arbitrator can initiate partial refunds on active escrows.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `escrow_id`: Escrow ID.
+    /// - `caller`: Address initiating partial refund (must be payer or arbitrator).
+    /// - `refund_amount`: Amount to refund (must be > 0 and <= remaining balance).
+    ///
+    /// # Returns
+    /// - `(bool, i128)`: Returns `(true, remaining_balance)` on success.
+    ///
+    /// # Errors
+    /// - Panics if escrow not found.
+    /// - Panics if escrow not in Active or Disputed status.
+    /// - Panics if caller is not payer or arbitrator.
+    /// - Panics if refund_amount <= 0.
+    /// - Panics if refund_amount > remaining balance.
+    /// - Token transfer fails if issues.
+    ///
+    /// # State Changes
+    /// - Transfers refund_amount to payer.
+    /// - Updates remaining balance (stored in PartialRefundBalance key).
+    /// - If refund equals remaining balance, updates status to Refunded.
+    /// - Emits partial_refund event with amount and remaining balance.
+    pub fn partial_refund(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        refund_amount: i128,
+    ) -> (bool, i128) {
+        caller.require_auth();
+
+        // Validate refund amount
+        assert!(refund_amount > 0, \"Refund amount must be greater than zero\");
+
+        let mut escrow: EscrowAccount = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect(\"Escrow not found\");
+
+        // Check status - only allow partial refunds on Active or Disputed escrows
+        assert!(
+            escrow.status == EscrowStatus::Active || escrow.status == EscrowStatus::Disputed,
+            \"Can only partially refund active or disputed escrows\"
+        );
+
+        // Authorization: only payer or arbitrator
+        let is_payer = caller == escrow.payer;
+        let is_arbitrator = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::Arbitrator)
+            .map(|arb| caller == arb)
+            .unwrap_or(false);
+
+        assert!(
+            is_payer || is_arbitrator,
+            \"Only payer or arbitrator can initiate partial refund\"
+        );
+
+        // Get current remaining balance
+        let remaining_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PartialRefundBalance(escrow_id))
+            .unwrap_or(escrow.amount);
+
+        // Validate refund amount doesn't exceed remaining balance
+        assert!(
+            refund_amount <= remaining_balance,
+            \"Refund amount exceeds remaining balance\"
+        );
+
+        // Calculate new remaining balance
+        let new_remaining_balance = remaining_balance - refund_amount;
+
+        // Transfer refund amount to payer
+        let token_client = TokenClient::new(&env, &escrow.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.payer,
+            &refund_amount,
+        );
+
+        // Update remaining balance
+        if new_remaining_balance > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PartialRefundBalance(escrow_id), &new_remaining_balance);
+        } else {
+            // If no balance remaining, mark escrow as fully refunded
+            escrow.status = EscrowStatus::Refunded;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(escrow_id), &escrow);
+            // Remove the balance tracking key
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PartialRefundBalance(escrow_id));
+        }
+
+        // Emit partial refund event
+        env.events().publish(
+            (symbol_short!("partial_ref"), escrow_id),
+            (caller, refund_amount, new_remaining_balance),
+        );
+
+        (true, new_remaining_balance)
     }
 
     /// Checks if escrow release conditions are met.
@@ -1266,5 +1379,407 @@ impl EscrowContract {
         // Second resolution should fail
         client.resolve_dispute(&arbitrator, &escrow_id, &DisputeOutcome::RefundToPayer, &None);
     }
+
+    // -------------------------------------------------------------------------
+    // Tests for partial refund mechanism
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_partial_refund_by_payer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Payer initiates partial refund of 300
+        let (success, remaining) = client.partial_refund(&escrow_id, &payer, &300_i128);
+        assert!(success);
+        assert_eq!(remaining, 700_i128);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+    }
+
+    #[test]
+    fn test_partial_refund_by_arbitrator() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+
+        env.mock_contract(&governance, |mock| {
+            mock.with_args(("is_admin", admin.clone())).returns(true);
+        });
+
+        client.set_arbitrator(&admin, &arbitrator);
+
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Arbitrator initiates partial refund
+        let (success, remaining) = client.partial_refund(&escrow_id, &arbitrator, &250_i128);
+        assert!(success);
+        assert_eq!(remaining, 750_i128);
+    }
+
+    #[test]
+    fn test_partial_refund_full_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Refund full amount through partial_refund
+        let (success, remaining) = client.partial_refund(&escrow_id, &payer, &amount);
+        assert!(success);
+        assert_eq!(remaining, 0);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Refunded);
+    }
+
+    #[test]
+    fn test_multiple_partial_refunds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // First partial refund: 200
+        let (success1, remaining1) = client.partial_refund(&escrow_id, &payer, &200_i128);
+        assert!(success1);
+        assert_eq!(remaining1, 800_i128);
+
+        // Second partial refund: 300
+        let (success2, remaining2) = client.partial_refund(&escrow_id, &payer, &300_i128);
+        assert!(success2);
+        assert_eq!(remaining2, 500_i128);
+
+        // Third partial refund: 500 (remainder)
+        let (success3, remaining3) = client.partial_refund(&escrow_id, &payer, &500_i128);
+        assert!(success3);
+        assert_eq!(remaining3, 0);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Refunded);
+    }
+
+    #[test]
+    #[should_panic(expected = "Refund amount must be greater than zero")]
+    fn test_partial_refund_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Try to refund zero amount - should fail
+        client.partial_refund(&escrow_id, &payer, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Refund amount must be greater than zero")]
+    fn test_partial_refund_negative_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Try to refund negative amount - should fail
+        client.partial_refund(&escrow_id, &payer, &-100_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Refund amount exceeds remaining balance")]
+    fn test_partial_refund_exceeds_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Try to refund more than balance
+        client.partial_refund(&escrow_id, &payer, &1001_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Refund amount exceeds remaining balance")]
+    fn test_partial_refund_exceeds_after_multiple() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // First refund: 400
+        client.partial_refund(&escrow_id, &payer, &400_i128);
+
+        // Try to refund more than remaining (should be 600)
+        client.partial_refund(&escrow_id, &payer, &700_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only payer or arbitrator can initiate partial refund")]
+    fn test_partial_refund_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Random address tries to partial refund - should fail
+        client.partial_refund(&escrow_id, &rando, &300_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only payer or arbitrator can initiate partial refund")]
+    fn test_partial_refund_payee_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Payee tries to partial refund - should fail (only payer or arbitrator)
+        client.partial_refund(&escrow_id, &payee, &300_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Can only partially refund active or disputed escrows")]
+    fn test_partial_refund_not_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Release the escrow first
+        client.release_funds(&escrow_id, &payer);
+
+        // Try to partial refund released escrow - should fail
+        client.partial_refund(&escrow_id, &payer, &300_i128);
+    }
+
+    #[test]
+    fn test_partial_refund_on_disputed_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Initiate dispute
+        client.initiate_dispute(&escrow_id, &payer, &String::from_str(&env, "Dispute reason"));
+
+        // Partial refund should work on disputed escrows
+        let (success, remaining) = client.partial_refund(&escrow_id, &payer, &400_i128);
+        assert!(success);
+        assert_eq!(remaining, 600_i128);
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Disputed);
+    }
+
+    #[test]
+    #[should_panic(expected = "Can only partially refund active or disputed escrows")]
+    fn test_partial_refund_refunded_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Full refund first
+        client.refund_escrow(&escrow_id);
+
+        // Try to partial refund already refunded escrow
+        client.partial_refund(&escrow_id, &payer, &100_i128);
+    }
+
+    #[test]
+    fn test_partial_refund_balance_tracking() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // First refund: 100
+        let (_, rem1) = client.partial_refund(&escrow_id, &payer, &100_i128);
+        assert_eq!(rem1, 900);
+
+        // Second refund: 200
+        let (_, rem2) = client.partial_refund(&escrow_id, &payer, &200_i128);
+        assert_eq!(rem2, 700);
+
+        // Third refund: 50
+        let (_, rem3) = client.partial_refund(&escrow_id, &payer, &50_i128);
+        assert_eq!(rem3, 650);
+
+        // Verify final balance hasn't changed status
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+    }
+
+    #[test]
+    fn test_partial_refund_integration_with_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Partial refund 300
+        let (_, remaining) = client.partial_refund(&escrow_id, &payer, &300_i128);
+        assert_eq!(remaining, 700);
+
+        // Now release remaining 700 to payee
+        assert!(client.release_funds(&escrow_id, &payer));
+
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+        // Note: Amount field still shows original 1000, but 300 was refunded and 700 released
+    }
 }
+
 
