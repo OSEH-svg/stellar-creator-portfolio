@@ -46,372 +46,218 @@ pub struct Proposal {
     pub created_at: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Event data structures
-//
-// Each struct is published as the *data* portion of an event so that
-// off-chain indexers can deserialise a single, self-contained value rather
-// than having to correlate multiple positional fields.
-// ---------------------------------------------------------------------------
-
-/// Emitted when a new governance proposal is created.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProposalCreatedEvent {
-    /// Unique proposal identifier.
-    pub proposal_id: u64,
-    /// Address that created the proposal.
-    pub proposer: Address,
-    /// Ledger timestamp at creation time.
-    pub timestamp: u64,
-}
-
-/// Emitted when an admin casts a vote on a proposal.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VoteCastEvent {
-    /// Proposal being voted on.
-    pub proposal_id: u64,
-    /// Address of the voter.
-    pub voter: Address,
-    /// `true` = vote in favour, `false` = vote against.
-    pub support: bool,
-    /// Voting power applied (currently always 1 per admin).
-    pub voting_power: u32,
-    /// Ledger timestamp of the vote.
-    pub timestamp: u64,
-}
-
-/// Emitted when a proposal is executed or rejected.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProposalExecutedEvent {
-    /// Proposal that was finalised.
-    pub proposal_id: u64,
-    /// Address that triggered execution.
-    pub executor: Address,
-    /// Final status: 1 = Executed, 2 = Rejected.
-    pub result: u32,
-    /// Total votes in favour at execution time.
-    pub votes_for: u32,
-    /// Total votes against at execution time.
-    pub votes_against: u32,
-    /// Ledger timestamp of execution.
-    pub timestamp: u64,
-}
-
-/// Emitted when an admin is added (directly or via proposal).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct AdminAddedEvent {
-    /// The newly added admin address.
-    pub admin: Address,
-    /// Address that authorised the addition (owner or "proposal").
-    pub added_by: Address,
-    /// Ledger timestamp.
-    pub timestamp: u64,
-}
-
-/// Emitted when an admin is removed (directly or via proposal).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct AdminRemovedEvent {
-    /// The removed admin address.
-    pub admin: Address,
-    /// Address that authorised the removal (owner or "proposal").
-    pub removed_by: Address,
-    /// Ledger timestamp.
-    pub timestamp: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Event topic symbols (max 9 chars for symbol_short!)
-// ---------------------------------------------------------------------------
-
-const GOVERNANCE: Symbol = symbol_short!("gov");
-
-// Topic symbols – kept short to stay within Soroban's 9-char limit.
-const EVT_PROP_NEW: Symbol = symbol_short!("prop_new");
-const EVT_VOTE: Symbol = symbol_short!("voted");
-const EVT_PROP_EXEC: Symbol = symbol_short!("prop_exec");
-const EVT_ADM_ADD: Symbol = symbol_short!("adm_add");
-const EVT_ADM_REM: Symbol = symbol_short!("adm_rem");
-
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
+// =============================================================================
+// SECURITY INVARIANTS (for formal verification / audit reference)
+// =============================================================================
+// INV-1: Only the stored owner may add or remove admins.
+// INV-2: Only admins may create proposals or vote.
+// INV-3: An admin may vote at most once per proposal (HasVoted key enforces this).
+// INV-4: Proposal status transitions: Pending → Executed | Rejected only.
+//        Terminal states never revert.
+// INV-5: execute_proposal applies state changes only when votes_for > votes_against
+//        AND votes_for > 0; otherwise marks Rejected.
+// INV-6: ProposalCounter is monotonically increasing; proposal IDs are unique.
+// =============================================================================
 
 #[contract]
 pub struct GovernanceContract;
 
+const GOVERNANCE: Symbol = symbol_short!("gov");
+
 #[contractimpl]
 impl GovernanceContract {
-    // -----------------------------------------------------------------------
-    // Initialisation
-    // -----------------------------------------------------------------------
+	/// Initialize the governance contract owner. Owner must authenticate.
+	pub fn init(env: Env, owner: Address) -> bool {
+		owner.require_auth();
+		env.storage().persistent().set(&DataKey::Owner, &owner);
+		true
+	}
 
-    /// Initialise the governance contract with an owner.
-    pub fn init(env: Env, owner: Address) -> bool {
-        owner.require_auth();
-        env.storage().persistent().set(&DataKey::Owner, &owner);
-        true
-    }
+	/// Add an admin. Only the owner may add admins.
+	pub fn add_admin(env: Env, owner: Address, admin: Address) -> bool {
+		owner.require_auth();
+		let stored_owner: Address = env
+			.storage()
+			.persistent()
+			.get(&DataKey::Owner)
+			.expect("Governance not initialized");
+		if stored_owner != owner {
+			panic!("Only owner can add admins");
+		}
+		env.storage()
+			.persistent()
+			.set(&DataKey::Admin(admin.clone()), &true);
+		// Event: admin added
+		env.events().publish((GOVERNANCE, symbol_short!("adm_added"), admin), (owner,));
+		true
+	}
 
-    // -----------------------------------------------------------------------
-    // Admin management
-    // -----------------------------------------------------------------------
+	/// Remove an admin. Only the owner may remove admins.
+	pub fn remove_admin(env: Env, owner: Address, admin: Address) -> bool {
+		owner.require_auth();
+		let stored_owner: Address = env
+			.storage()
+			.persistent()
+			.get(&DataKey::Owner)
+			.expect("Governance not initialized");
+		if stored_owner != owner {
+			panic!("Only owner can remove admins");
+		}
+		env.storage().persistent().remove(&DataKey::Admin(admin.clone()));
+		env.events().publish((GOVERNANCE, symbol_short!("adm_rmvd"), admin), (owner,));
+		true
+	}
 
-    /// Add an admin. Only the owner may call this.
-    pub fn add_admin(env: Env, owner: Address, admin: Address) -> bool {
-        owner.require_auth();
-        let stored_owner: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Owner)
-            .expect("Governance not initialized");
-        if stored_owner != owner {
-            panic!("Only owner can add admins");
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin(admin.clone()), &true);
+	/// Check whether an address is an admin.
+	pub fn is_admin(env: Env, addr: Address) -> bool {
+		env.storage()
+			.persistent()
+			.get::<DataKey, bool>(&DataKey::Admin(addr))
+			.unwrap_or(false)
+	}
 
-        env.events().publish(
-            (GOVERNANCE, EVT_ADM_ADD),
-            AdminAddedEvent {
-                admin,
-                added_by: owner,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        true
-    }
+	// -------------------------------------------------------------------------
+	// Proposal logic (Issue #192)
+	// -------------------------------------------------------------------------
 
-    /// Remove an admin. Only the owner may call this.
-    pub fn remove_admin(env: Env, owner: Address, admin: Address) -> bool {
-        owner.require_auth();
-        let stored_owner: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Owner)
-            .expect("Governance not initialized");
-        if stored_owner != owner {
-            panic!("Only owner can remove admins");
-        }
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Admin(admin.clone()));
+	/// Creates a new governance proposal.
+	/// Only an active admin can create a proposal.
+	pub fn create_proposal(env: Env, creator: Address, prop_type: ProposalType) -> u64 {
+		creator.require_auth();
+		if !Self::is_admin(env.clone(), creator.clone()) {
+			panic!("Only admins can create proposals");
+		}
 
-        env.events().publish(
-            (GOVERNANCE, EVT_ADM_REM),
-            AdminRemovedEvent {
-                admin,
-                removed_by: owner,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-        true
-    }
+		let mut counter: u64 = env.storage().instance().get(&DataKey::ProposalCounter).unwrap_or(0);
+		counter += 1;
 
-    /// Returns `true` if `addr` is a registered admin.
-    pub fn is_admin(env: Env, addr: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get::<DataKey, bool>(&DataKey::Admin(addr))
-            .unwrap_or(false)
-    }
+		let proposal = Proposal {
+			id: counter,
+			creator: creator.clone(),
+			prop_type,
+			status: ProposalStatus::Pending,
+			votes_for: 0,
+			votes_against: 0,
+			created_at: env.ledger().timestamp(),
+		};
 
-    // -----------------------------------------------------------------------
-    // Proposal lifecycle
-    // -----------------------------------------------------------------------
+		env.storage().persistent().set(&DataKey::Proposal(counter), &proposal);
+		env.storage().instance().set(&DataKey::ProposalCounter, &counter);
 
-    /// Create a new governance proposal. Only admins may propose.
-    ///
-    /// # Events
-    /// Emits `(gov, prop_new) → ProposalCreatedEvent` on success.
-    pub fn create_proposal(env: Env, creator: Address, prop_type: ProposalType) -> u64 {
-        creator.require_auth();
-        if !Self::is_admin(env.clone(), creator.clone()) {
-            panic!("Only admins can create proposals");
-        }
+		env.events().publish(
+			(GOVERNANCE, symbol_short!("prop_crt"), counter),
+			(creator.clone(),),
+		);
 
-        let mut counter: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ProposalCounter)
-            .unwrap_or(0);
-        counter += 1;
+		counter
+	}
 
-        let now = env.ledger().timestamp();
-        let proposal = Proposal {
-            id: counter,
-            creator: creator.clone(),
-            prop_type,
-            status: ProposalStatus::Pending,
-            votes_for: 0,
-            votes_against: 0,
-            created_at: now,
-        };
+	/// Cast a vote on a Pending proposal.
+	/// Only admins can vote. An admin can only vote once per proposal.
+	pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool) -> bool {
+		voter.require_auth();
+		if !Self::is_admin(env.clone(), voter.clone()) {
+			panic!("Only admins can vote");
+		}
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Proposal(counter), &proposal);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProposalCounter, &counter);
+		let key = DataKey::Proposal(proposal_id);
+		let mut proposal: Proposal = env
+			.storage()
+			.persistent()
+			.get(&key)
+			.expect("Proposal not found");
 
-        env.events().publish(
-            (GOVERNANCE, EVT_PROP_NEW),
-            ProposalCreatedEvent {
-                proposal_id: counter,
-                proposer: creator,
-                timestamp: now,
-            },
-        );
+		if proposal.status != ProposalStatus::Pending {
+			panic!("Proposal is not in Pending status");
+		}
 
-        counter
-    }
+		let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
+		if env.storage().persistent().has(&voted_key) {
+			panic!("Already voted");
+		}
 
-    /// Cast a vote on a Pending proposal. Each admin may vote once.
-    ///
-    /// # Events
-    /// Emits `(gov, voted) → VoteCastEvent` on success.
-    pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool) -> bool {
-        voter.require_auth();
-        if !Self::is_admin(env.clone(), voter.clone()) {
-            panic!("Only admins can vote");
-        }
+		if support {
+			proposal.votes_for += 1;
+		} else {
+			proposal.votes_against += 1;
+		}
 
-        let key = DataKey::Proposal(proposal_id);
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Proposal not found");
+		env.storage().persistent().set(&key, &proposal);
+		env.storage().persistent().set(&voted_key, &true);
 
-        if proposal.status != ProposalStatus::Pending {
-            panic!("Proposal is not in Pending status");
-        }
+		env.events().publish(
+			(GOVERNANCE, symbol_short!("voted"), proposal_id),
+			(voter.clone(), support),
+		);
 
-        let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
-        if env.storage().persistent().has(&voted_key) {
-            panic!("Already voted");
-        }
+		true
+	}
 
-        if support {
-            proposal.votes_for += 1;
-        } else {
-            proposal.votes_against += 1;
-        }
+	/// Executes a proposal.
+	/// Only admins can trigger execution, and the proposal must be Pending.
+	/// If `votes_for > votes_against` and `votes_for > 0`, it executes the specific State Change Action.
+	/// Otherwise, it marks the proposal as Rejected.
+	pub fn execute_proposal(env: Env, caller: Address, proposal_id: u64) -> bool {
+		caller.require_auth();
+		if !Self::is_admin(env.clone(), caller.clone()) {
+			panic!("Only admins can execute proposals");
+		}
 
-        env.storage().persistent().set(&key, &proposal);
-        env.storage().persistent().set(&voted_key, &true);
+		let key = DataKey::Proposal(proposal_id);
+		let mut proposal: Proposal = env
+			.storage()
+			.persistent()
+			.get(&key)
+			.expect("Proposal not found");
 
-        env.events().publish(
-            (GOVERNANCE, EVT_VOTE),
-            VoteCastEvent {
-                proposal_id,
-                voter,
-                support,
-                voting_power: 1,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
+		if proposal.status != ProposalStatus::Pending {
+			panic!("Proposal is not in Pending status");
+		}
 
-        true
-    }
+		// Execution condition
+		if proposal.votes_for > proposal.votes_against && proposal.votes_for > 0 {
+			proposal.status = ProposalStatus::Executed;
 
-    /// Execute or reject a Pending proposal. Only admins may trigger execution.
-    ///
-    /// A proposal is **executed** when `votes_for > votes_against && votes_for > 0`;
-    /// otherwise it is **rejected**.
-    ///
-    /// # Events
-    /// - Emits `(gov, prop_exec) → ProposalExecutedEvent` always.
-    /// - Emits `(gov, adm_add) → AdminAddedEvent` when an AddAdmin proposal executes.
-    /// - Emits `(gov, adm_rem) → AdminRemovedEvent` when a RemoveAdmin proposal executes.
-    pub fn execute_proposal(env: Env, caller: Address, proposal_id: u64) -> bool {
-        caller.require_auth();
-        if !Self::is_admin(env.clone(), caller.clone()) {
-            panic!("Only admins can execute proposals");
-        }
+			// Apply State Changes directly mapped to enum
+			match &proposal.prop_type {
+				ProposalType::AddAdmin(new_admin) => {
+					env.storage()
+						.persistent()
+						.set(&DataKey::Admin(new_admin.clone()), &true);
+					env.events().publish(
+						(GOVERNANCE, symbol_short!("adm_added"), new_admin.clone()),
+						(Symbol::new(&env, "proposal"),),
+					);
+				}
+				ProposalType::RemoveAdmin(old_admin) => {
+					env.storage().persistent().remove(&DataKey::Admin(old_admin.clone()));
+					env.events().publish(
+						(GOVERNANCE, symbol_short!("adm_rmvd"), old_admin.clone()),
+						(Symbol::new(&env, "proposal"),),
+					);
+				}
+			}
+		} else {
+			proposal.status = ProposalStatus::Rejected;
+		}
 
-        let key = DataKey::Proposal(proposal_id);
-        let mut proposal: Proposal = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Proposal not found");
+		env.storage().persistent().set(&key, &proposal);
 
-        if proposal.status != ProposalStatus::Pending {
-            panic!("Proposal is not in Pending status");
-        }
+		env.events().publish(
+			(GOVERNANCE, symbol_short!("prop_exec"), proposal_id),
+			(proposal.status as u32,),
+		);
 
-        let now = env.ledger().timestamp();
+		true
+	}
 
-        if proposal.votes_for > proposal.votes_against && proposal.votes_for > 0 {
-            proposal.status = ProposalStatus::Executed;
-
-            match &proposal.prop_type {
-                ProposalType::AddAdmin(new_admin) => {
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::Admin(new_admin.clone()), &true);
-                    env.events().publish(
-                        (GOVERNANCE, EVT_ADM_ADD),
-                        AdminAddedEvent {
-                            admin: new_admin.clone(),
-                            added_by: caller.clone(),
-                            timestamp: now,
-                        },
-                    );
-                }
-                ProposalType::RemoveAdmin(old_admin) => {
-                    env.storage()
-                        .persistent()
-                        .remove(&DataKey::Admin(old_admin.clone()));
-                    env.events().publish(
-                        (GOVERNANCE, EVT_ADM_REM),
-                        AdminRemovedEvent {
-                            admin: old_admin.clone(),
-                            removed_by: caller.clone(),
-                            timestamp: now,
-                        },
-                    );
-                }
-            }
-        } else {
-            proposal.status = ProposalStatus::Rejected;
-        }
-
-        let result_code = proposal.status as u32;
-        let votes_for = proposal.votes_for;
-        let votes_against = proposal.votes_against;
-
-        env.storage().persistent().set(&key, &proposal);
-
-        env.events().publish(
-            (GOVERNANCE, EVT_PROP_EXEC),
-            ProposalExecutedEvent {
-                proposal_id,
-                executor: caller,
-                result: result_code,
-                votes_for,
-                votes_against,
-                timestamp: now,
-            },
-        );
-
-        true
-    }
-
-    /// Retrieve full proposal details by ID.
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Proposal(proposal_id))
-            .expect("Proposal not found")
-    }
+	/// Retrieves the full details of a proposal by ID.
+	pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+		env.storage()
+			.persistent()
+			.get(&DataKey::Proposal(proposal_id))
+			.expect("Proposal not found")
+	}
 }
 
 // ---------------------------------------------------------------------------
