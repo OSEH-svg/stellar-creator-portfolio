@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token::Client as TokenClient, Address, Env,
+    contract, contractimpl, contracttype, symbol_short, token::Client as TokenClient, Address, Env,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -11,6 +11,7 @@ pub enum EscrowStatus {
     Released = 1,
     Refunded = 2,
     Disputed = 3,
+    EmergencyWithdrawn = 4,
 }
 
 #[derive(Clone)]
@@ -36,6 +37,7 @@ pub struct EscrowAccount {
 pub enum DataKey {
     EscrowCounter,
     Escrow(u64),
+    Governance,
 }
 
 #[contract]
@@ -261,10 +263,79 @@ impl EscrowContract {
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0)
     }
-}
 
-#[cfg(test)]
-mod tests {
+    /// Sets the governance contract address.
+    /// Can only be called once by an authorized caller.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `caller`: Authorized caller.
+    /// - `governance`: Governance contract address.
+    ///
+    /// # Returns
+    /// - `bool`: Always `true` on success.
+    ///
+    /// # Errors
+    /// - Panics if caller fails authentication.
+    /// - Panics if governance already set.
+    pub fn set_governance(env: Env, caller: Address, governance: Address) -> bool {
+        caller.require_auth();
+        if env.storage().persistent().has(&DataKey::Governance) {
+            panic!("Governance already set");
+        }
+        env.storage().persistent().set(&DataKey::Governance, &governance);
+        true
+    }
+
+    /// Emergency withdrawal of stuck funds from disputed escrow.
+    /// Only callable by governance admin.
+    ///
+    /// # Parameters
+    /// - `env`: Soroban environment.
+    /// - `caller`: Caller address (must be admin).
+    /// - `escrow_id`: Escrow ID.
+    /// - `recipient`: Address to receive the funds.
+    ///
+    /// # Returns
+    /// - `bool`: Always `true` on success.
+    ///
+    /// # Errors
+    /// - Panics if caller not authenticated.
+    /// - Panics if caller not admin.
+    /// - Panics if escrow not found or not disputed.
+    /// - Token transfer fails if issues.
+    ///
+    /// # State Changes
+    /// - Transfers full amount to recipient.
+    /// - Updates status to `EmergencyWithdrawn`.
+    /// - Emits event.
+    pub fn emergency_withdraw(env: Env, caller: Address, escrow_id: u64, recipient: Address) -> bool {
+        caller.require_auth();
+
+        let governance: Address = env.storage().persistent().get(&DataKey::Governance).expect("Governance not set");
+
+        let is_admin: bool = env.invoke_contract(
+            &governance,
+            &symbol_short!("is_admin"),
+            (caller.clone(),).into_val(&env),
+        );
+
+        assert!(is_admin, "Unauthorized: not an admin");
+
+        let mut escrow: EscrowAccount = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).expect("Escrow not found");
+
+        assert!(escrow.status == EscrowStatus::Disputed, "Can only emergency withdraw disputed escrows");
+
+        let token_client = TokenClient::new(&env, &escrow.token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &escrow.amount);
+
+        escrow.status = EscrowStatus::EmergencyWithdrawn;
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.events().publish((symbol_short!("emergency_withdraw"), escrow_id), (recipient, escrow.amount));
+
+        true
+    }
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
@@ -275,5 +346,108 @@ mod tests {
         let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
         assert_eq!(client.get_escrow_count(), 0);
+    }
+
+    #[test]
+    fn test_emergency_withdraw_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        // Set governance
+        client.set_governance(&admin, &governance);
+
+        // Mock is_admin to return true
+        env.mock_contract(&governance, |mock| {
+            mock.with_args(("is_admin", admin.clone())).returns(true);
+        });
+
+        // Deposit
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Set status to Disputed
+        env.as_contract(&contract_id, || {
+            let mut escrow: EscrowAccount = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
+            escrow.status = EscrowStatus::Disputed;
+            env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+        });
+
+        // Emergency withdraw
+        assert!(client.emergency_withdraw(&admin, &escrow_id, &payee));
+
+        // Check status
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::EmergencyWithdrawn);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized: not an admin")]
+    fn test_emergency_withdraw_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+
+        // Mock is_admin to return false for rando
+        env.mock_contract(&governance, |mock| {
+            mock.with_args(("is_admin", rando.clone())).returns(false);
+        });
+
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        env.as_contract(&contract_id, || {
+            let mut escrow: EscrowAccount = env.storage().persistent().get(&DataKey::Escrow(escrow_id)).unwrap();
+            escrow.status = EscrowStatus::Disputed;
+            env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+        });
+
+        // Should panic
+        client.emergency_withdraw(&rando, &escrow_id, &payee);
+    }
+
+    #[test]
+    #[should_panic(expected = "Can only emergency withdraw disputed escrows")]
+    fn test_emergency_withdraw_not_disputed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        let governance = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = env.register_stellar_asset_contract(Address::generate(&env));
+        let amount = 1000_i128;
+
+        client.set_governance(&admin, &governance);
+
+        env.mock_contract(&governance, |mock| {
+            mock.with_args(("is_admin", admin.clone())).returns(true);
+        });
+
+        let escrow_id = client.deposit(&payer, &payee, &amount, &token, &ReleaseCondition::OnCompletion);
+
+        // Status is Active, not Disputed
+        // Should panic
+        client.emergency_withdraw(&admin, &escrow_id, &payee);
     }
 }
