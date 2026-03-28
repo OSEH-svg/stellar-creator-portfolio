@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { messageCrypto } from '@/hooks/useMessages'
-import { RealtimeWebSocket } from '@/lib/websocket'
+import { RealtimeWebSocket } from '@/lib/websocket/index'
 
 declare const global: typeof globalThis & { WebSocket: any }
 
@@ -15,6 +15,7 @@ describe('message encryption', () => {
 
 describe('websocket wrapper', () => {
   class FakeWebSocket {
+    static OPEN = 1
     public readyState = 0
     public onopen: (() => void) | null = null
     public onmessage: ((event: { data: string }) => void) | null = null

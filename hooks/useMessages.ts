@@ -1,7 +1,7 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { RealtimeWebSocket, WSStatus } from '@/lib/websocket'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { RealtimeWebSocket, WSStatus } from '@/lib/websocket/index'
 import { toast } from 'sonner'
 
 export type Attachment = {
@@ -98,6 +98,25 @@ export function useMessages(threadId: string, currentUserId: string) {
       .catch(() => setCryptoKey(null))
   }, [passphrase, threadId])
 
+  const decryptMessages = useCallback(async (items: ChatMessage[]) => {
+    if (!cryptoKey) {
+      return items.map((msg) => ({ ...msg, plaintext: 'Encrypted message. Enter passphrase to decrypt.' }))
+    }
+
+    const decrypted = await Promise.all(
+      items.map(async (msg) => {
+        try {
+          const plaintext = await decryptText(msg.ciphertext, msg.iv, cryptoKey)
+          return { ...msg, plaintext }
+        } catch (err) {
+          console.warn('Failed to decrypt', err)
+          return { ...msg, plaintext: 'Unable to decrypt with current passphrase' }
+        }
+      })
+    )
+    return decrypted
+  }, [cryptoKey])
+
   useEffect(() => {
     if (typeof window === 'undefined') return
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
@@ -144,26 +163,7 @@ export function useMessages(threadId: string, currentUserId: string) {
       unsubscribe()
       socket.close()
     }
-  }, [threadId, currentUserId])
-
-  const decryptMessages = async (items: ChatMessage[]) => {
-    if (!cryptoKey) {
-      return items.map((msg) => ({ ...msg, plaintext: 'Encrypted message. Enter passphrase to decrypt.' }))
-    }
-
-    const decrypted = await Promise.all(
-      items.map(async (msg) => {
-        try {
-          const plaintext = await decryptText(msg.ciphertext, msg.iv, cryptoKey)
-          return { ...msg, plaintext }
-        } catch (err) {
-          console.warn('Failed to decrypt', err)
-          return { ...msg, plaintext: 'Unable to decrypt with current passphrase' }
-        }
-      })
-    )
-    return decrypted
-  }
+  }, [threadId, currentUserId, decryptMessages])
 
   const sendMessage = async ({ text, file, threadId: tId, senderId, recipientId }: SendMessageInput) => {
     if (!socketRef.current) return

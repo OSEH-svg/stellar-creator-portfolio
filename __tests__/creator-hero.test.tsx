@@ -2,11 +2,15 @@ import React from 'react';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import CreatorProfilePage from '../app/creators/[id]/page';
-import { creators } from '../lib/creators-data';
+import { creators } from '@/lib/services/creators-data';
 
 vi.mock('next/navigation', () => ({
   notFound: () => undefined,
   useRouter: () => ({ back: vi.fn() }),
+}));
+
+vi.mock('next-auth/react', () => ({
+  useSession: () => ({ data: null, status: 'unauthenticated' })
 }));
 
 vi.mock('next/image', () => ({
