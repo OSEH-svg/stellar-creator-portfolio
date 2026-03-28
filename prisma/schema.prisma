@@ -66,6 +66,8 @@ model User {
   inAppNotifications     InAppNotification[]
   emailDeliveryLogs      EmailDeliveryLog[]
   emailUnsubscribeToken  String? @unique
+  matchFeedback       MatchFeedback[]
+  matchNotifications  MatchNotification[]
 
   @@index([email])
 }
@@ -265,4 +267,31 @@ enum EmailDeliveryStatus {
   SENT
   FAILED
   SKIPPED
+model MatchFeedback {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  strategy  String
+  mode      String
+  contextId String?
+  matchId   String
+  score     Float?
+  helpful   Boolean
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([strategy, helpful])
+}
+
+model MatchNotification {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title           String
+  body            String   @db.Text
+  read            Boolean  @default(false)
+  relatedBountyId String?
+  createdAt       DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
