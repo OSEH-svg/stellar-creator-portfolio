@@ -2,6 +2,10 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+
 #[contracttype]
 pub enum DataKey {
     Owner,
@@ -12,6 +16,10 @@ pub enum DataKey {
     Proposal(u64),
     HasVoted(u64, Address),
 }
+
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -667,9 +675,80 @@ impl GovernanceContract {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{Env, IntoVal};
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    struct TestEnv {
+        env: Env,
+        owner: Address,
+        contract_id: Address,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(GovernanceContract, ());
+            let owner = Address::generate(&env);
+            GovernanceContractClient::new(&env, &contract_id).init(&owner);
+            TestEnv { env, owner, contract_id }
+        }
+
+        fn client(&self) -> GovernanceContractClient {
+            GovernanceContractClient::new(&self.env, &self.contract_id)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin management – existing behaviour preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_and_check_admin() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        assert!(client.add_admin(&t.owner, &admin));
+        assert!(client.is_admin(&admin));
+        assert!(client.remove_admin(&t.owner, &admin));
+        assert!(!client.is_admin(&admin));
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposal lifecycle – existing behaviour preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proposal_lifecycle() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        let new_admin = Address::generate(&t.env);
+
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+
+        let prop_id = client.create_proposal(&admin1, &ProposalType::AddAdmin(new_admin.clone()));
+        assert_eq!(prop_id, 1);
+        assert_eq!(client.get_proposal(&prop_id).status, ProposalStatus::Pending);
+
+        client.vote(&admin1, &prop_id, &true);
+        assert_eq!(client.get_proposal(&prop_id).votes_for, 1);
+
+        assert!(client.execute_proposal(&admin2, &prop_id));
+        assert_eq!(client.get_proposal(&prop_id).status, ProposalStatus::Executed);
 	use super::*;
 	use soroban_sdk::testutils::Address as _;
 	use soroban_sdk::Env;
@@ -830,6 +909,556 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Already voted")]
+    fn test_double_vote_panic() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(target));
+        client.vote(&admin, &prop_id, &true);
+        client.vote(&admin, &prop_id, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only admins can create proposals")]
+    fn test_unauthorized_propose_panic() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let rando = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.create_proposal(&rando, &ProposalType::AddAdmin(target));
+    }
+
+    // -----------------------------------------------------------------------
+    // Event: ProposalCreatedEvent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_proposal_created_emitted() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+
+        t.env.ledger().set_timestamp(42);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(target.clone()));
+
+        let all_events = t.env.events().all();
+        let prop_new_sym: Symbol = symbol_short!("prop_new");
+        let gov_sym: Symbol = symbol_short!("gov");
+
+        let found = all_events.iter().any(|e| {
+            let topics = e.0;
+            topics.len() >= 2
+                && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                && topics.get(1) == Some(prop_new_sym.clone().into_val(&t.env))
+        });
+        assert!(found, "prop_new event not found");
+
+        let prop_event = all_events
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(prop_new_sym.clone().into_val(&t.env))
+            })
+            .expect("prop_new event missing");
+
+        let data: ProposalCreatedEvent = prop_event.1.into_val(&t.env);
+        assert_eq!(data.proposal_id, prop_id);
+        assert_eq!(data.proposer, admin);
+        assert_eq!(data.timestamp, 42);
+    }
+
+    #[test]
+    fn test_event_proposal_created_increments_id() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let t1 = Address::generate(&t.env);
+        let t2 = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+
+        let id1 = client.create_proposal(&admin, &ProposalType::AddAdmin(t1));
+        let id2 = client.create_proposal(&admin, &ProposalType::AddAdmin(t2));
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let prop_new_sym: Symbol = symbol_short!("prop_new");
+        let count = t.env
+            .events()
+            .all()
+            .iter()
+            .filter(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(prop_new_sym.clone().into_val(&t.env))
+            })
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Event: VoteCastEvent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_vote_cast_for() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(target));
+
+        t.env.ledger().set_timestamp(100);
+        client.vote(&admin, &prop_id, &true);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let voted_sym: Symbol = symbol_short!("voted");
+
+        let vote_event = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(voted_sym.clone().into_val(&t.env))
+            })
+            .expect("voted event missing");
+
+        let data: VoteCastEvent = vote_event.1.into_val(&t.env);
+        assert_eq!(data.proposal_id, prop_id);
+        assert_eq!(data.voter, admin);
+        assert!(data.support);
+        assert_eq!(data.voting_power, 1);
+        assert_eq!(data.timestamp, 100);
+    }
+
+    #[test]
+    fn test_event_vote_cast_against() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(target));
+
+        client.vote(&admin, &prop_id, &false);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let voted_sym: Symbol = symbol_short!("voted");
+
+        let vote_event = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(voted_sym.clone().into_val(&t.env))
+            })
+            .expect("voted event missing");
+
+        let data: VoteCastEvent = vote_event.1.into_val(&t.env);
+        assert!(!data.support);
+        assert_eq!(data.voting_power, 1);
+    }
+
+    #[test]
+    fn test_event_multiple_votes_emitted() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+        let prop_id = client.create_proposal(&admin1, &ProposalType::AddAdmin(target));
+
+        client.vote(&admin1, &prop_id, &true);
+        client.vote(&admin2, &prop_id, &false);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let voted_sym: Symbol = symbol_short!("voted");
+
+        let count = t.env
+            .events()
+            .all()
+            .iter()
+            .filter(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(voted_sym.clone().into_val(&t.env))
+            })
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Event: ProposalExecutedEvent – executed path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_proposal_executed_success() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+        let prop_id = client.create_proposal(&admin1, &ProposalType::AddAdmin(target));
+        client.vote(&admin1, &prop_id, &true);
+
+        t.env.ledger().set_timestamp(200);
+        client.execute_proposal(&admin2, &prop_id);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let exec_sym: Symbol = symbol_short!("prop_exec");
+
+        let exec_event = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(exec_sym.clone().into_val(&t.env))
+            })
+            .expect("prop_exec event missing");
+
+        let data: ProposalExecutedEvent = exec_event.1.into_val(&t.env);
+        assert_eq!(data.proposal_id, prop_id);
+        assert_eq!(data.executor, admin2);
+        assert_eq!(data.result, ProposalStatus::Executed as u32);
+        assert_eq!(data.votes_for, 1);
+        assert_eq!(data.votes_against, 0);
+        assert_eq!(data.timestamp, 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // Event: ProposalExecutedEvent – rejected path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_proposal_rejected() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+        let prop_id = client.create_proposal(&admin1, &ProposalType::AddAdmin(target));
+        client.vote(&admin1, &prop_id, &false);
+        client.execute_proposal(&admin2, &prop_id);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let exec_sym: Symbol = symbol_short!("prop_exec");
+
+        let exec_event = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(exec_sym.clone().into_val(&t.env))
+            })
+            .expect("prop_exec event missing");
+
+        let data: ProposalExecutedEvent = exec_event.1.into_val(&t.env);
+        assert_eq!(data.result, ProposalStatus::Rejected as u32);
+        assert_eq!(data.votes_for, 0);
+        assert_eq!(data.votes_against, 1);
+    }
+
+    #[test]
+    fn test_event_proposal_rejected_no_votes() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+        let prop_id = client.create_proposal(&admin1, &ProposalType::AddAdmin(target));
+        client.execute_proposal(&admin2, &prop_id);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let exec_sym: Symbol = symbol_short!("prop_exec");
+
+        let exec_event = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(exec_sym.clone().into_val(&t.env))
+            })
+            .expect("prop_exec event missing");
+
+        let data: ProposalExecutedEvent = exec_event.1.into_val(&t.env);
+        assert_eq!(data.result, ProposalStatus::Rejected as u32);
+        assert_eq!(data.votes_for, 0);
+        assert_eq!(data.votes_against, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Event: AdminAddedEvent / AdminRemovedEvent via direct owner calls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_admin_added_direct() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        t.env.ledger().set_timestamp(77);
+        client.add_admin(&t.owner, &admin);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let adm_add_sym: Symbol = symbol_short!("adm_add");
+
+        let evt = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(adm_add_sym.clone().into_val(&t.env))
+            })
+            .expect("adm_add event missing");
+
+        let data: AdminAddedEvent = evt.1.into_val(&t.env);
+        assert_eq!(data.admin, admin);
+        assert_eq!(data.added_by, t.owner);
+        assert_eq!(data.timestamp, 77);
+    }
+
+    #[test]
+    fn test_event_admin_removed_direct() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        t.env.ledger().set_timestamp(88);
+        client.remove_admin(&t.owner, &admin);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let adm_rem_sym: Symbol = symbol_short!("adm_rem");
+
+        let evt = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(adm_rem_sym.clone().into_val(&t.env))
+            })
+            .expect("adm_rem event missing");
+
+        let data: AdminRemovedEvent = evt.1.into_val(&t.env);
+        assert_eq!(data.admin, admin);
+        assert_eq!(data.removed_by, t.owner);
+        assert_eq!(data.timestamp, 88);
+    }
+
+    // -----------------------------------------------------------------------
+    // Event: AdminAddedEvent / AdminRemovedEvent via proposal execution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_admin_added_via_proposal() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let new_admin = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(new_admin.clone()));
+        client.vote(&admin, &prop_id, &true);
+        client.execute_proposal(&admin, &prop_id);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let adm_add_sym: Symbol = symbol_short!("adm_add");
+
+        // Two adm_add events: one from add_admin, one from execute_proposal
+        let count = t.env
+            .events()
+            .all()
+            .iter()
+            .filter(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(adm_add_sym.clone().into_val(&t.env))
+            })
+            .count();
+        assert_eq!(count, 2);
+
+        // The last adm_add event should be for new_admin
+        let last_evt = t.env
+            .events()
+            .all()
+            .iter()
+            .filter(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(adm_add_sym.clone().into_val(&t.env))
+            })
+            .last()
+            .unwrap();
+        let data: AdminAddedEvent = last_evt.1.into_val(&t.env);
+        assert_eq!(data.admin, new_admin);
+        assert_eq!(data.added_by, admin);
+    }
+
+    #[test]
+    fn test_event_admin_removed_via_proposal() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+
+        let prop_id = client.create_proposal(&admin1, &ProposalType::RemoveAdmin(admin2.clone()));
+        client.vote(&admin1, &prop_id, &true);
+        client.execute_proposal(&admin1, &prop_id);
+
+        assert!(!client.is_admin(&admin2));
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let adm_rem_sym: Symbol = symbol_short!("adm_rem");
+
+        let evt = t.env
+            .events()
+            .all()
+            .iter()
+            .find(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(adm_rem_sym.clone().into_val(&t.env))
+            })
+            .expect("adm_rem event missing");
+
+        let data: AdminRemovedEvent = evt.1.into_val(&t.env);
+        assert_eq!(data.admin, admin2);
+        assert_eq!(data.removed_by, admin1);
+    }
+
+    // -----------------------------------------------------------------------
+    // No spurious events on error paths
+    // -----------------------------------------------------------------------
+
+    /// Verify that a successful single vote emits exactly one `voted` event,
+    /// confirming no phantom emissions occur on the happy path.
+    #[test]
+    fn test_exactly_one_vote_event_per_cast() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(target));
+        client.vote(&admin, &prop_id, &true);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let voted_sym: Symbol = symbol_short!("voted");
+        let count = t.env
+            .events()
+            .all()
+            .iter()
+            .filter(|e| {
+                let topics = e.0.clone();
+                topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                    && topics.get(1) == Some(voted_sym.clone().into_val(&t.env))
+            })
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Already voted")]
+    fn test_double_vote_no_second_event() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin = Address::generate(&t.env);
+        let target = Address::generate(&t.env);
+        client.add_admin(&t.owner, &admin);
+        let prop_id = client.create_proposal(&admin, &ProposalType::AddAdmin(target));
+        client.vote(&admin, &prop_id, &true);
+        client.vote(&admin, &prop_id, &true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: full proposal round-trip with event ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_full_round_trip_event_ordering() {
+        let t = TestEnv::new();
+        let client = t.client();
+        let admin1 = Address::generate(&t.env);
+        let admin2 = Address::generate(&t.env);
+        let new_admin = Address::generate(&t.env);
+
+        client.add_admin(&t.owner, &admin1);
+        client.add_admin(&t.owner, &admin2);
+
+        let prop_id = client.create_proposal(&admin1, &ProposalType::AddAdmin(new_admin.clone()));
+        client.vote(&admin1, &prop_id, &true);
+        client.vote(&admin2, &prop_id, &true);
+        client.execute_proposal(&admin1, &prop_id);
+
+        let gov_sym: Symbol = symbol_short!("gov");
+        let all = t.env.events().all();
+
+        // Collect second-topic symbols for all gov events, in emission order
+        let topic1s: soroban_sdk::Vec<Symbol> = all
+            .iter()
+            .filter_map(|e| {
+                let topics = e.0.clone();
+                if topics.len() >= 2
+                    && topics.get(0) == Some(gov_sym.clone().into_val(&t.env))
+                {
+                    topics.get(1).map(|v| v.into_val(&t.env))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Expected: adm_add, adm_add, prop_new, voted, voted, adm_add (exec), prop_exec
+        assert_eq!(topic1s.len(), 7);
+        assert_eq!(topic1s.get(0).unwrap(), symbol_short!("adm_add"));
+        assert_eq!(topic1s.get(1).unwrap(), symbol_short!("adm_add"));
+        assert_eq!(topic1s.get(2).unwrap(), symbol_short!("prop_new"));
+        assert_eq!(topic1s.get(3).unwrap(), symbol_short!("voted"));
+        assert_eq!(topic1s.get(4).unwrap(), symbol_short!("voted"));
+        assert_eq!(topic1s.get(5).unwrap(), symbol_short!("adm_add"));
+        assert_eq!(topic1s.get(6).unwrap(), symbol_short!("prop_exec"));
     #[should_panic(expected = "No voting power available")]
     fn test_double_vote_panic() {
         let env = Env::default();
