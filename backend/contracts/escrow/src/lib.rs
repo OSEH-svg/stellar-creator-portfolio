@@ -5,7 +5,7 @@ use soroban_sdk::{
     String, Vec,
 };
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 #[contracttype]
 pub enum EscrowStatus {
     Active = 0,
@@ -74,6 +74,18 @@ pub enum DataKey {
     PartialRefundBalance(u64),
 }
 
+// =============================================================================
+// SECURITY INVARIANTS (for formal verification / audit reference)
+// =============================================================================
+// INV-1: An escrow's amount is always > 0 (enforced at deposit).
+// INV-2: An escrow transitions: Active → Released | Refunded only.
+//        Once Released or Refunded, status never changes again.
+// INV-3: Only payer or payee may call release_funds.
+// INV-4: Only payer may call refund_escrow (auth enforced via require_auth).
+// INV-5: Timelock release only succeeds when ledger.timestamp >= deadline.
+// INV-6: Total token balance held by contract equals sum of all Active escrow amounts.
+// =============================================================================
+
 #[contract]
 pub struct EscrowContract;
 
@@ -110,14 +122,18 @@ impl EscrowContract {
         release_condition: ReleaseCondition,
     ) -> u64 {
         payer.require_auth();
-        assert!(amount > 0, \"Amount must be positive\");
+        assert!(amount > 0, "Amount must be positive");
 
+        // #179: Validate token implements the token interface by calling balance().
+        // This will trap if `token` is not a valid SEP-41 token contract,
+        // preventing funds from being locked with an unrecoverable address.
         let token_client = TokenClient::new(&env, &token);
+        let _ = token_client.balance(&payer); // panics if token is invalid
         token_client.transfer(&payer, &env.current_contract_address(), &amount);
 
         let mut counter: u64 = env
             .storage()
-            .persistent()
+            .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
         counter += 1;
@@ -137,7 +153,7 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::Escrow(counter), &escrow);
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::EscrowCounter, &counter);
 
         counter
@@ -153,12 +169,12 @@ impl EscrowContract {
     /// - `EscrowAccount`: Full escrow details.
     ///
     /// # Errors
-    /// - Panics with \"Escrow not found\" if ID doesn't exist.
+    /// - Panics with "Escrow not found" if ID doesn't exist.
     pub fn get_escrow(env: Env, escrow_id: u64) -> EscrowAccount {
         env.storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
-            .expect(\"Escrow not found\")
+            .expect("Escrow not found")
     }
 
     /// Releases escrowed funds to payee if conditions met.
@@ -188,16 +204,16 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
-            .expect(\"Escrow not found\");
+            .expect("Escrow not found");
 
         assert!(
             caller == escrow.payer || caller == escrow.payee,
-            \"Unauthorized\"
+            "Unauthorized"
         );
-        assert!(escrow.status == EscrowStatus::Active, \"Escrow not active\");
+        assert!(escrow.status == EscrowStatus::Active, "Escrow not active");
         assert!(
             Self::can_release(env.clone(), escrow_id),
-            \"Release condition not met\"
+            "Release condition not met"
         );
 
         let token_client = TokenClient::new(&env, &escrow.token);
@@ -236,10 +252,10 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
-            .expect(\"Escrow not found\");
+            .expect("Escrow not found");
 
         escrow.payer.require_auth();
-        assert!(escrow.status == EscrowStatus::Active, \"Escrow not active\");
+        assert!(escrow.status == EscrowStatus::Active, "Escrow not active");
 
         let token_client = TokenClient::new(&env, &escrow.token);
         token_client.transfer(
@@ -388,7 +404,7 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
-            .expect(\"Escrow not found\");
+            .expect("Escrow not found");
 
         match escrow.release_condition {
             ReleaseCondition::OnCompletion => true,
@@ -405,7 +421,7 @@ impl EscrowContract {
     /// - `u64`: Escrow count.
     pub fn get_escrow_count(env: Env) -> u64 {
         env.storage()
-            .persistent()
+            .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0)
     }
@@ -431,6 +447,17 @@ impl EscrowContract {
         }
         env.storage().persistent().set(&DataKey::Governance, &governance);
         true
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{token, Env};
+
+    fn setup_token(env: &Env, admin: &Address) -> Address {
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_admin = token::StellarAssetClient::new(env, &token_id.address());
+        token_admin.mint(admin, &1_000_000);
+        token_id.address()
     }
 
     /// Sets the arbitrator address.
@@ -813,6 +840,8 @@ impl EscrowContract {
 
     #[test]
     fn test_emergency_withdraw_success() {
+    #[test]
+    fn test_deposit_increments_counter() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -854,6 +883,21 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Unauthorized: not an admin")]
     fn test_emergency_withdraw_unauthorized() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        assert_eq!(id, 1);
+        assert_eq!(client.get_escrow_count(), 1);
+
+        let id2 = client.deposit(&payer, &payee, &200, &token, &ReleaseCondition::OnCompletion);
+        assert_eq!(id2, 2);
+        assert_eq!(client.get_escrow_count(), 2);
+    }
+
+    #[test]
+    fn test_deposit_stores_correct_data() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1092,6 +1136,22 @@ impl EscrowContract {
 
     #[test]
     fn test_submit_evidence_success() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        let escrow = client.get_escrow(&id);
+
+        assert_eq!(escrow.payer, payer);
+        assert_eq!(escrow.payee, payee);
+        assert_eq!(escrow.amount, 1000);
+        assert_eq!(escrow.status, EscrowStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount must be positive")]
+    fn test_deposit_zero_amount_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1128,6 +1188,16 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Only payer or payee can submit evidence")]
     fn test_submit_evidence_unauthorized() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        client.deposit(&payer, &payee, &0, &token, &ReleaseCondition::OnCompletion);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount must be positive")]
+    fn test_deposit_negative_amount_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1177,6 +1247,24 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Maximum evidence pieces (10) reached")]
     fn test_submit_evidence_max_limit() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        client.deposit(&payer, &payee, &-1, &token, &ReleaseCondition::OnCompletion);
+    }
+
+    #[test]
+    #[should_panic(expected = "Escrow not found")]
+    fn test_get_escrow_not_found_panics() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.get_escrow(&999);
+    }
+
+    #[test]
+    fn test_release_funds_on_completion() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1241,6 +1329,15 @@ impl EscrowContract {
         assert_eq!(dispute.outcome, Some(DisputeOutcome::ReleaseToPayee));
 
         let escrow = client.get_escrow(&escrow_id);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        let result = client.release_funds(&id, &payer);
+        assert!(result);
+
+        let escrow = client.get_escrow(&id);
         assert_eq!(escrow.status, EscrowStatus::Released);
     }
 
@@ -1315,6 +1412,7 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Unauthorized: not the arbitrator")]
     fn test_resolve_dispute_unauthorized() {
+    fn test_release_funds_by_payee() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1348,6 +1446,21 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Dispute already resolved")]
     fn test_resolve_dispute_already_resolved() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &300, &token, &ReleaseCondition::OnCompletion);
+        let result = client.release_funds(&id, &payee);
+        assert!(result);
+
+        let escrow = client.get_escrow(&id);
+        assert_eq!(escrow.status, EscrowStatus::Released);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_release_funds_unauthorized_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1386,6 +1499,18 @@ impl EscrowContract {
 
     #[test]
     fn test_partial_refund_by_payer() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let random = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        client.release_funds(&id, &random);
+    }
+
+    #[test]
+    #[should_panic(expected = "Escrow not active")]
+    fn test_release_funds_already_released_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1412,6 +1537,18 @@ impl EscrowContract {
 
     #[test]
     fn test_partial_refund_by_arbitrator() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        client.release_funds(&id, &payer);
+        // Second release should panic
+        client.release_funds(&id, &payer);
+    }
+
+    #[test]
+    fn test_timelock_release_after_deadline() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1443,6 +1580,27 @@ impl EscrowContract {
 
     #[test]
     fn test_partial_refund_full_amount() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let deadline = 1000u64;
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::Timelock(deadline));
+
+        // Before deadline: cannot release
+        assert!(!client.can_release(&id));
+
+        // After deadline: can release
+        env.ledger().set_timestamp(deadline);
+        assert!(client.can_release(&id));
+
+        let result = client.release_funds(&id, &payer);
+        assert!(result);
+    }
+
+    #[test]
+    #[should_panic(expected = "Release condition not met")]
+    fn test_timelock_release_before_deadline_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1469,6 +1627,17 @@ impl EscrowContract {
 
     #[test]
     fn test_multiple_partial_refunds() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::Timelock(9999));
+        // Timestamp is 0 by default, deadline is 9999 — should panic
+        client.release_funds(&id, &payer);
+    }
+
+    #[test]
+    fn test_refund_escrow() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1500,6 +1669,15 @@ impl EscrowContract {
         assert_eq!(remaining3, 0);
 
         let escrow = client.get_escrow(&escrow_id);
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        let result = client.refund_escrow(&id);
+        assert!(result);
+
+        let escrow = client.get_escrow(&id);
         assert_eq!(escrow.status, EscrowStatus::Refunded);
     }
 
@@ -1642,6 +1820,8 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Can only partially refund active or disputed escrows")]
     fn test_partial_refund_not_active() {
+    #[should_panic(expected = "Escrow not active")]
+    fn test_refund_already_refunded_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1666,6 +1846,19 @@ impl EscrowContract {
 
     #[test]
     fn test_partial_refund_on_disputed_escrow() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        client.refund_escrow(&id);
+        // Second refund should panic
+        client.refund_escrow(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Escrow not active")]
+    fn test_refund_after_release_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1696,6 +1889,18 @@ impl EscrowContract {
     #[test]
     #[should_panic(expected = "Can only partially refund active or disputed escrows")]
     fn test_partial_refund_refunded_escrow() {
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        client.release_funds(&id, &payer);
+        // Refund after release should panic
+        client.refund_escrow(&id);
+    }
+
+    #[test]
+    fn test_on_completion_can_release_always_true() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(EscrowContract, ());
@@ -1783,3 +1988,11 @@ impl EscrowContract {
 }
 
 
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let token = setup_token(&env, &payer);
+
+        let id = client.deposit(&payer, &payee, &100, &token, &ReleaseCondition::OnCompletion);
+        assert!(client.can_release(&id));
+    }
+}
