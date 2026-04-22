@@ -1,4 +1,5 @@
 use actix_web::{middleware, web, App, HttpResponse, HttpServer};
+use rand::RngCore;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -194,6 +195,24 @@ fn generate_qr_code_url(user_id: &str, secret: &str, issuer: &str) -> String {
     otpauth_url
 }
 
+/// Generate a cryptographically secure random nonce (32 bytes, hex-encoded)
+fn generate_nonce() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+#[derive(Serialize)]
+pub struct ChallengeResponse {
+    pub nonce: String,
+}
+
+async fn get_challenge() -> HttpResponse {
+    let nonce = generate_nonce();
+    tracing::debug!("Generated auth challenge nonce");
+    HttpResponse::Ok().json(ApiResponse::ok(ChallengeResponse { nonce }))
+}
+
 async fn health() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
         "status": "healthy",
@@ -292,6 +311,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(middleware::Logger::default())
             .wrap(middleware::NormalizePath::trim())
             .route("/health", web::get().to(health))
+            .route("/api/auth/challenge", web::get().to(get_challenge))
             .route("/api/auth/mfa/setup", web::post().to(setup_mfa))
             .route("/api/auth/mfa/verify", web::post().to(verify_mfa))
             .route("/api/auth/mfa/backup-codes", web::post().to(generate_backup_codes))
@@ -347,6 +367,46 @@ mod tests {
         assert!(formatted.contains('-'));
     }
 
+    #[test]
+    fn test_generate_nonce_length() {
+        let nonce = generate_nonce();
+        // 32 bytes hex-encoded = 64 hex characters
+        assert_eq!(nonce.len(), 64);
+    }
+
+    #[test]
+    fn test_generate_nonce_is_hex() {
+        let nonce = generate_nonce();
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_generate_nonce_uniqueness() {
+        let n1 = generate_nonce();
+        let n2 = generate_nonce();
+        assert_ne!(n1, n2, "Two nonces should not be identical");
+    }
+
+    #[actix_web::test]
+    async fn test_get_challenge_endpoint() {
+        use actix_web::test;
+        let app = test::init_service(
+            App::new().route("/api/auth/challenge", web::get().to(get_challenge)),
+        )
+        .await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/auth/challenge")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+
+        assert!(resp.status().is_success());
+
+        let body: serde_json::Value = test::read_body_json(resp).await;
+        assert_eq!(body["success"], true);
+        let nonce = body["data"]["nonce"].as_str().expect("nonce must be a string");
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
     // ── Signature verification tests ─────────────────────────────────────────
 
     /// Build a deterministic keypair + signature for testing.
