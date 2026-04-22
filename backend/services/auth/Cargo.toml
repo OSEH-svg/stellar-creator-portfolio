@@ -25,3 +25,4 @@ qrcode = "0.14"
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+ed25519-dalek.workspace = true

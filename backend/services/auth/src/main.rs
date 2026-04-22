@@ -1,4 +1,5 @@
 use actix_web::{middleware, web, App, HttpResponse, HttpServer};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use totp_lite::{totp_custom, Sha1};
@@ -14,6 +15,57 @@ pub enum MfaError {
     QrCodeFailed(String),
     #[error("Base32 decode error")]
     Base32DecodeError,
+}
+
+/// Errors that can occur during Ed25519 signature verification.
+#[derive(Error, Debug, PartialEq)]
+pub enum SigError {
+    #[error("Invalid public key: {0}")]
+    InvalidPublicKey(String),
+    #[error("Invalid signature: {0}")]
+    InvalidSignature(String),
+    #[error("Signature verification failed")]
+    VerificationFailed,
+}
+
+/// Verify an Ed25519 signature against a message hash and public key.
+///
+/// # Arguments
+/// * `public_key_bytes` – 32-byte Ed25519 public key (raw bytes).
+/// * `signature_bytes`  – 64-byte Ed25519 signature (raw bytes).
+/// * `message`          – The original message whose hash was signed.
+///                        The function hashes it with SHA-256 before verifying.
+///
+/// # Returns
+/// `Ok(true)` when the signature is valid, `Err(SigError)` otherwise.
+pub fn verify_signature(
+    public_key_bytes: &[u8],
+    signature_bytes: &[u8],
+    message: &[u8],
+) -> Result<bool, SigError> {
+    use sha2::{Digest, Sha256};
+
+    let key_bytes: [u8; 32] = public_key_bytes
+        .try_into()
+        .map_err(|_| SigError::InvalidPublicKey(format!("expected 32 bytes, got {}", public_key_bytes.len())))?;
+
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| SigError::InvalidPublicKey(e.to_string()))?;
+
+    let sig_bytes: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| SigError::InvalidSignature(format!("expected 64 bytes, got {}", signature_bytes.len())))?;
+
+    let signature = Signature::from_bytes(&sig_bytes);
+
+    // Hash the message with SHA-256 before verifying so callers pass the
+    // raw message rather than a pre-hashed digest.
+    let digest = Sha256::digest(message);
+
+    verifying_key
+        .verify(digest.as_slice(), &signature)
+        .map(|_| true)
+        .map_err(|_| SigError::VerificationFailed)
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -293,5 +345,80 @@ mod tests {
         let formatted = format!("{}-{}", &code[..4], &code[4..]);
         assert_eq!(formatted.len(), 9); // 4 + 1 (dash) + 4
         assert!(formatted.contains('-'));
+    }
+
+    // ── Signature verification tests ─────────────────────────────────────────
+
+    /// Build a deterministic keypair + signature for testing.
+    fn make_test_sig(message: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        // Fixed 32-byte seed so tests are deterministic.
+        let seed = [0x42u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let digest = Sha256::digest(message);
+        let signature = signing_key.sign(digest.as_slice());
+        let verifying_key = signing_key.verifying_key();
+        (verifying_key.to_bytes().to_vec(), signature.to_bytes().to_vec())
+    }
+
+    #[test]
+    fn test_verify_signature_valid() {
+        let message = b"stellar-auth-challenge-nonce";
+        let (pub_key, sig) = make_test_sig(message);
+        assert_eq!(verify_signature(&pub_key, &sig, message), Ok(true));
+    }
+
+    #[test]
+    fn test_verify_signature_wrong_message() {
+        let message = b"stellar-auth-challenge-nonce";
+        let (pub_key, sig) = make_test_sig(message);
+        let result = verify_signature(&pub_key, &sig, b"tampered-message");
+        assert_eq!(result, Err(SigError::VerificationFailed));
+    }
+
+    #[test]
+    fn test_verify_signature_wrong_public_key() {
+        let message = b"stellar-auth-challenge-nonce";
+        let (_, sig) = make_test_sig(message);
+        let wrong_key = [0xFFu8; 32];
+        // A random 32-byte array may or may not be a valid compressed point;
+        // either InvalidPublicKey or VerificationFailed is acceptable.
+        let result = verify_signature(&wrong_key, &sig, message);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_signature_invalid_key_length() {
+        let result = verify_signature(&[0u8; 16], &[0u8; 64], b"msg");
+        assert_eq!(
+            result,
+            Err(SigError::InvalidPublicKey(
+                "expected 32 bytes, got 16".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_verify_signature_invalid_sig_length() {
+        let message = b"stellar-auth-challenge-nonce";
+        let (pub_key, _) = make_test_sig(message);
+        let result = verify_signature(&pub_key, &[0u8; 32], message);
+        assert_eq!(
+            result,
+            Err(SigError::InvalidSignature(
+                "expected 64 bytes, got 32".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_verify_signature_corrupted_signature() {
+        let message = b"stellar-auth-challenge-nonce";
+        let (pub_key, mut sig) = make_test_sig(message);
+        sig[0] ^= 0xFF; // flip bits in first byte
+        let result = verify_signature(&pub_key, &sig, message);
+        assert_eq!(result, Err(SigError::VerificationFailed));
     }
 }
