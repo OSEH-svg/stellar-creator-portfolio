@@ -1,4 +1,5 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_cors::Cors;
+use actix_web::{http, web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tracing_subscriber;
@@ -237,6 +238,43 @@ async fn release_escrow(path: web::Path<u64>) -> HttpResponse {
     HttpResponse::Ok().json(response)
 }
 
+// ==================== CORS ====================
+
+/// Build the CORS middleware from environment configuration.
+///
+/// Allowed origins are read from the `CORS_ALLOWED_ORIGINS` environment
+/// variable as a comma-separated list (e.g. `http://localhost:3000,https://app.stellar.dev`).
+/// When the variable is absent the default `http://localhost:3000` is used,
+/// which covers local Next.js development.
+///
+/// All standard HTTP methods and the headers required by a JSON API
+/// (`Content-Type`, `Authorization`, `Accept`) are permitted.
+/// Credentials (cookies / auth headers) are allowed so wallet-auth flows work.
+pub fn cors_middleware() -> Cors {
+    let allowed_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut cors = Cors::default()
+        .allowed_methods(vec!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+        .allowed_headers(vec![
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::header::ACCEPT,
+        ])
+        .supports_credentials()
+        .max_age(3600);
+
+    for origin in &allowed_origins {
+        cors = cors.allowed_origin(origin);
+    }
+
+    cors
+}
+
 // ==================== Main ====================
 
 #[actix_web::main]
@@ -259,6 +297,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(|| {
         App::new()
+            .wrap(cors_middleware())
             .wrap(middleware::Logger::default())
             .wrap(middleware::NormalizePath::trim())
             // Health check
@@ -297,5 +336,83 @@ mod tests {
         let response: ApiResponse<String> = ApiResponse::err("error".to_string());
         assert!(!response.success);
         assert_eq!(response.error, Some("error".to_string()));
+    }
+
+    // ── CORS tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cors_middleware_builds_with_default_origin() {
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+        let _cors = cors_middleware();
+    }
+
+    #[test]
+    fn test_cors_middleware_builds_with_multiple_origins() {
+        std::env::set_var(
+            "CORS_ALLOWED_ORIGINS",
+            "http://localhost:3000,https://app.stellar.dev",
+        );
+        let _cors = cors_middleware();
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[actix_web::test]
+    async fn test_cors_preflight_returns_200() {
+        use actix_web::test as awtest;
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "http://localhost:3000");
+
+        let app = awtest::init_service(
+            App::new()
+                .wrap(cors_middleware())
+                .route("/health", web::get().to(health)),
+        )
+        .await;
+
+        let req = awtest::TestRequest::default()
+            .method(actix_web::http::Method::OPTIONS)
+            .uri("/health")
+            .insert_header(("Origin", "http://localhost:3000"))
+            .insert_header(("Access-Control-Request-Method", "GET"))
+            .to_request();
+
+        let resp = awtest::call_service(&app, req).await;
+        assert!(
+            resp.status().is_success(),
+            "preflight should return 2xx, got {}",
+            resp.status()
+        );
+        let acao = resp
+            .headers()
+            .get("Access-Control-Allow-Origin")
+            .expect("Access-Control-Allow-Origin header must be present");
+        assert_eq!(acao, "http://localhost:3000");
+
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[actix_web::test]
+    async fn test_cors_disallowed_origin_has_no_acao_header() {
+        use actix_web::test as awtest;
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "http://localhost:3000");
+
+        let app = awtest::init_service(
+            App::new()
+                .wrap(cors_middleware())
+                .route("/health", web::get().to(health)),
+        )
+        .await;
+
+        let req = awtest::TestRequest::get()
+            .uri("/health")
+            .insert_header(("Origin", "https://evil.example.com"))
+            .to_request();
+
+        let resp = awtest::call_service(&app, req).await;
+        assert!(
+            resp.headers().get("Access-Control-Allow-Origin").is_none(),
+            "disallowed origin must not receive ACAO header"
+        );
+
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
     }
 }

@@ -27,3 +27,4 @@ hex.workspace = true
 thiserror.workspace = true
 rand = { version = "0.8", features = ["getrandom"] }
 urlencoding = "2.1"
+ed25519-dalek.workspace = true
