@@ -845,6 +845,15 @@ mod tests {
         let req = awtest::TestRequest::get()
             .uri("/api/creators/alex-studio/reputation")
             .to_request();
+    async fn escrow_get_integration_returns_active_payload() {
+        use actix_web::test as awtest;
+
+        let app = awtest::init_service(
+            App::new().route("/api/escrow/{id}", web::get().to(get_escrow)),
+        )
+        .await;
+
+        let req = awtest::TestRequest::get().uri("/api/escrow/7").to_request();
         let resp = awtest::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
 
@@ -873,6 +882,21 @@ mod tests {
 
         let req = awtest::TestRequest::get()
             .uri("/api/creators/unknown-creator/reputation")
+        assert_eq!(json["data"]["id"], 7);
+        assert_eq!(json["data"]["status"], "active");
+    }
+
+    #[actix_web::test]
+    async fn escrow_release_integration_returns_released_payload() {
+        use actix_web::test as awtest;
+
+        let app = awtest::init_service(
+            App::new().route("/api/escrow/{id}/release", web::post().to(release_escrow)),
+        )
+        .await;
+
+        let req = awtest::TestRequest::post()
+            .uri("/api/escrow/7/release")
             .to_request();
         let resp = awtest::call_service(&app, req).await;
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
@@ -881,5 +905,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["data"]["aggregation"]["totalReviews"], 0);
         assert_eq!(json["data"]["aggregation"]["averageRating"], 0.0);
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["status"], "released");
+        assert!(json["data"]["transaction_id"].is_string());
     }
 }
