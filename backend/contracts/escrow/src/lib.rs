@@ -183,6 +183,80 @@ impl EscrowContract {
         true
     }
 
+    /// Resolve a disputed escrow. Only the platform admin may call this.
+    ///
+    /// `resolution`: `true` → release funds to payee; `false` → refund to payer.
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        release_to_payee: bool,
+    ) -> bool {
+        admin.require_auth();
+
+        // Verify caller is the stored platform admin
+        let admin_key = Symbol::new(&env, "platform_admin");
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get::<Symbol, Address>(&admin_key)
+            .expect("Platform admin not set");
+        assert_eq!(admin, stored_admin, "Only platform admin can resolve disputes");
+
+        let key = Symbol::new(&env, &format!("escrow_{}", escrow_id));
+        let mut escrow = env
+            .storage()
+            .persistent()
+            .get::<Symbol, EscrowAccount>(&key)
+            .expect("Escrow not found");
+
+        assert!(escrow.status == EscrowStatus::Disputed, "Escrow is not disputed");
+
+        let recipient = if release_to_payee {
+            escrow.payee.clone()
+        } else {
+            escrow.payer.clone()
+        };
+
+        TokenClient::new(&env, &escrow.token)
+            .transfer(&env.current_contract_address(), &recipient, &escrow.amount);
+
+        escrow.status = if release_to_payee {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Refunded
+        };
+        escrow.released_at = Some(env.ledger().timestamp());
+        env.storage().persistent().set(&key, &escrow);
+
+        // Emit dispute_resolved event for indexers
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("resolved")),
+            (escrow_id, escrow.bounty_id, recipient, release_to_payee),
+        );
+
+        true
+    }
+
+    /// Set the platform admin address. Can only be called once (bootstrap).
+    pub fn set_admin(env: Env, admin: Address) {
+        admin.require_auth();
+        let admin_key = Symbol::new(&env, "platform_admin");
+        assert!(
+            env.storage().persistent().get::<Symbol, Address>(&admin_key).is_none(),
+            "Admin already set"
+        );
+        env.storage().persistent().set(&admin_key, &admin);
+    }
+
+    /// Get the current platform admin address.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get::<Symbol, Address>(&Symbol::new(&env, "platform_admin"))
+            .expect("Platform admin not set")
+    }
+
     /// Add a milestone to an active escrow. Sum of milestone amounts must not exceed escrow amount.
     pub fn add_milestone(
         env: Env,
@@ -507,6 +581,90 @@ mod tests {
         let id = contract.deposit(&1u64, &payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
         contract.dispute_escrow(&payer, &id);
         contract.release_funds(&payee, &id);
+    }
+
+    // ── resolve_dispute ───────────────────────────────────────────────────────
+
+    #[test]
+    fn admin_can_resolve_dispute_to_payee() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        let admin = Address::generate(&env);
+        contract.set_admin(&admin);
+
+        let id = contract.deposit(&1u64, &payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        contract.dispute_escrow(&payer, &id);
+        contract.resolve_dispute(&admin, &id, &true);
+
+        assert_eq!(tc.balance(&payee), 1000);
+        assert_eq!(tc.balance(&cid), 0);
+        assert!(contract.get_escrow(&id).status == EscrowStatus::Released);
+    }
+
+    #[test]
+    fn admin_can_resolve_dispute_to_payer() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        let admin = Address::generate(&env);
+        contract.set_admin(&admin);
+
+        let id = contract.deposit(&1u64, &payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        contract.dispute_escrow(&payee, &id);
+        contract.resolve_dispute(&admin, &id, &false);
+
+        assert_eq!(tc.balance(&payer), 1000);
+        assert_eq!(tc.balance(&cid), 0);
+        assert!(contract.get_escrow(&id).status == EscrowStatus::Refunded);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only platform admin can resolve disputes")]
+    fn non_admin_cannot_resolve_dispute() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+
+        let admin = Address::generate(&env);
+        contract.set_admin(&admin);
+
+        let id = contract.deposit(&1u64, &payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        contract.dispute_escrow(&payer, &id);
+        contract.resolve_dispute(&payer, &id, &true); // payer is not admin
+    }
+
+    #[test]
+    #[should_panic(expected = "Escrow is not disputed")]
+    fn cannot_resolve_active_escrow() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+
+        let admin = Address::generate(&env);
+        contract.set_admin(&admin);
+
+        let id = contract.deposit(&1u64, &payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        contract.resolve_dispute(&admin, &id, &true); // not disputed yet
+    }
+
+    #[test]
+    #[should_panic(expected = "Admin already set")]
+    fn set_admin_can_only_be_called_once() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+        let _ = (token, payer, payee); // suppress unused warnings
+
+        let admin = Address::generate(&env);
+        contract.set_admin(&admin);
+        contract.set_admin(&admin); // second call must panic
     }
 
     // ── timelock ──────────────────────────────────────────────────────────────

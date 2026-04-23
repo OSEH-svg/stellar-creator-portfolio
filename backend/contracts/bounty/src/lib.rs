@@ -220,6 +220,38 @@ impl BountyContract {
             .unwrap_or(0)
     }
 
+    /// Optimized view: return all bounties matching a given status.
+    /// Avoids loading all bounties when only a subset is needed.
+    pub fn get_bounties_by_status(env: Env, status: BountyStatus) -> Vec<Bounty> {
+        let mut result = Vec::new(&env);
+        let counter = Self::get_bounties_count(env.clone());
+        for i in 1..=counter {
+            let key = Symbol::new(&env, &format!("bounty_{}", i));
+            if let Some(bounty) = env.storage().persistent().get::<Symbol, Bounty>(&key) {
+                if bounty.status == status {
+                    result.push_back(bounty);
+                }
+            }
+        }
+        result
+    }
+
+    /// Optimized view: return a paginated slice of all bounties.
+    /// `offset` is zero-based; returns at most `limit` items.
+    pub fn get_bounties_paginated(env: Env, offset: u64, limit: u64) -> Vec<Bounty> {
+        let mut result = Vec::new(&env);
+        let counter = Self::get_bounties_count(env.clone());
+        let start = offset + 1; // storage keys are 1-based
+        let end = (start + limit).min(counter + 1);
+        for i in start..end {
+            let key = Symbol::new(&env, &format!("bounty_{}", i));
+            if let Some(bounty) = env.storage().persistent().get::<Symbol, Bounty>(&key) {
+                result.push_back(bounty);
+            }
+        }
+        result
+    }
+
     pub fn get_applications(env: Env, bounty_id: u64) -> Vec<BountyApplication> {
         let mut applications = Vec::new(&env);
         let app_counter_key = Symbol::new(&env, "application_counter");
