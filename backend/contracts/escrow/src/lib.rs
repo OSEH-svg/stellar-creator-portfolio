@@ -512,4 +512,191 @@ mod tests {
         let id = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
         contract.add_milestone(&payer, &id, &0, &Symbol::new(&env, "x"), &1001);
     }
+
+    // ── balance conservation ──────────────────────────────────────────────────
+
+    /// Total tokens out (payee + payer) must equal total tokens deposited.
+    #[test]
+    fn balance_conservation_release() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 2500);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        let id = contract.deposit(&payer, &payee, &2500, &token, &ReleaseCondition::OnCompletion);
+        assert_eq!(tc.balance(&cid), 2500);
+        assert_eq!(tc.balance(&payer), 0);
+
+        contract.release_funds(&payer, &id);
+
+        assert_eq!(tc.balance(&payee), 2500);  // payee received all
+        assert_eq!(tc.balance(&cid), 0);        // contract holds nothing
+        assert_eq!(tc.balance(&payer), 0);      // payer gave it all
+    }
+
+    #[test]
+    fn balance_conservation_refund() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1800);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        let id = contract.deposit(&payer, &payee, &1800, &token, &ReleaseCondition::OnCompletion);
+        contract.refund_escrow(&payer, &id);
+
+        assert_eq!(tc.balance(&payer), 1800);   // payer got it back
+        assert_eq!(tc.balance(&payee), 0);       // payee received nothing
+        assert_eq!(tc.balance(&cid), 0);         // contract holds nothing
+    }
+
+    // ── multi-escrow isolation ────────────────────────────────────────────────
+
+    /// Releasing escrow A must not affect escrow B's locked balance.
+    #[test]
+    fn releasing_one_escrow_does_not_drain_another() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 3000);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        // Deposit two separate escrows from the same payer
+        let id_a = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        let id_b = contract.deposit(&payer, &payee, &2000, &token, &ReleaseCondition::OnCompletion);
+        assert_eq!(tc.balance(&cid), 3000);
+
+        contract.release_funds(&payer, &id_a);
+
+        // Only escrow A's amount left in contract
+        assert_eq!(tc.balance(&cid), 2000);
+        assert_eq!(tc.balance(&payee), 1000);
+
+        // Escrow B is still active and untouched
+        assert!(contract.get_escrow(&id_b).status == EscrowStatus::Active);
+    }
+
+    /// IDs are monotonically increasing and never reused.
+    #[test]
+    fn escrow_ids_are_monotonically_increasing() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 3000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+
+        let id1 = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        let id2 = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        let id3 = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+        assert!(id2 > id1 && id3 > id2);
+    }
+
+    // ── double-spend prevention ───────────────────────────────────────────────
+
+    /// Funds locked in a disputed escrow must remain in the contract.
+    #[test]
+    fn disputed_escrow_funds_stay_locked() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        let id = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        contract.dispute_escrow(&payer, &id);
+
+        // Balance unchanged — funds are locked
+        assert_eq!(tc.balance(&cid), 1000);
+        assert_eq!(tc.balance(&payee), 0);
+        assert_eq!(tc.balance(&payer), 0);
+    }
+
+    /// Two milestones whose combined amount equals the escrow can both be released
+    /// but the total payout must not exceed the deposited amount.
+    #[test]
+    fn two_milestones_total_payout_equals_deposit() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+        let tc = TokenClient::new(&env, &token);
+
+        let id = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        contract.add_milestone(&payer, &id, &0, &Symbol::new(&env, "p1"), &600);
+        contract.add_milestone(&payer, &id, &1, &Symbol::new(&env, "p2"), &400);
+
+        contract.release_milestone(&payer, &id, &0);
+        assert_eq!(tc.balance(&payee), 600);
+        assert_eq!(tc.balance(&cid), 400);
+
+        contract.release_milestone(&payer, &id, &1);
+        assert_eq!(tc.balance(&payee), 1000);
+        assert_eq!(tc.balance(&cid), 0);
+    }
+
+    /// A milestone from escrow A cannot be released against escrow B.
+    #[test]
+    #[should_panic(expected = "Milestone not found")]
+    fn milestone_cross_escrow_release_is_rejected() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 2000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+
+        let id_a = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+        let id_b = contract.deposit(&payer, &payee, &1000, &token, &ReleaseCondition::OnCompletion);
+
+        contract.add_milestone(&payer, &id_a, &0, &Symbol::new(&env, "m"), &500);
+
+        // Attempt to release escrow A's milestone index 0 against escrow B
+        contract.release_milestone(&payer, &id_b, &0);
+    }
+
+    /// Depositing a negative amount must be rejected.
+    #[test]
+    #[should_panic(expected = "Amount must be positive")]
+    fn deposit_negative_amount_panics() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+        contract.deposit(&payer, &payee, &-1, &token, &ReleaseCondition::OnCompletion);
+    }
+
+    // ── timelock boundary ─────────────────────────────────────────────────────
+
+    /// Release at exactly the deadline timestamp must succeed.
+    #[test]
+    fn release_at_exact_timelock_boundary_succeeds() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 500);
+        let cid = env.register_contract(None, EscrowContract);
+        let contract = EscrowContractClient::new(&env, &cid);
+
+        env.ledger().set_timestamp(100);
+        let id = contract.deposit(&payer, &payee, &500, &token, &ReleaseCondition::Timelock(200));
+
+        // Set timestamp to exactly the deadline
+        env.ledger().set_timestamp(200);
+        contract.release_funds(&payer, &id);
+
+        assert!(contract.get_escrow(&id).status == EscrowStatus::Released);
+        assert_eq!(TokenClient::new(&env, &token).balance(&payee), 500);
+    }
+
+    /// Release one second before the deadline must be rejected.
+    #[test]
+    #[should_panic(expected = "Release condition not met")]
+    fn release_one_second_before_timelock_is_rejected() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 500);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+
+        env.ledger().set_timestamp(100);
+        let id = contract.deposit(&payer, &payee, &500, &token, &ReleaseCondition::Timelock(200));
+
+        env.ledger().set_timestamp(199);
+        contract.release_funds(&payer, &id);
+    }
 }
