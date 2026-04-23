@@ -65,3 +65,27 @@ export function formatDeadline(deadline: Date | string): string {
 export function capitalise(str: string): string {
   return str.charAt(0).toUpperCase() + str.slice(1);
 }
+
+/**
+ * Format a star rating as "4.8 / 5" or "No ratings yet".
+ */
+export function formatRating(rating?: number, reviewCount?: number): string {
+  if (rating == null) return 'No ratings yet';
+  const reviews = reviewCount != null ? ` (${reviewCount})` : '';
+  return `${rating.toFixed(1)} / 5${reviews}`;
+}
+
+/**
+ * Format years of experience as "8 yrs exp" or "< 1 yr exp".
+ */
+export function formatExperience(years?: number): string {
+  if (years == null || years < 1) return '< 1 yr exp';
+  return `${years} yr${years === 1 ? '' : 's'} exp`;
+}
+
+/**
+ * Truncate a string to maxLength, appending "…" if truncated.
+ */
+export function truncate(str: string, maxLength: number): string {
+  return str.length <= maxLength ? str : `${str.slice(0, maxLength)}…`;
+}

@@ -130,3 +130,18 @@ export async function fetchBounties(params?: {
   const query = qs.toString() ? `?${qs}` : '';
   return apiFetch(`/api/bounties${query}`);
 }
+
+/** GET /api/freelancers — optionally filter by discipline. */
+export async function fetchFreelancers(params?: {
+  discipline?: string;
+}): Promise<{ freelancers: unknown[]; total: number }> {
+  const qs = new URLSearchParams();
+  if (params?.discipline) qs.set('discipline', params.discipline);
+  const query = qs.toString() ? `?${qs}` : '';
+  return apiFetch(`/api/freelancers${query}`);
+}
+
+/** GET /api/freelancers/:address */
+export async function fetchFreelancer(address: string): Promise<unknown> {
+  return apiFetch(`/api/freelancers/${address}`);
+}

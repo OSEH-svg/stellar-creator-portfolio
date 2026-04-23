@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { apiFetch, fetchCreator, fetchCreators, ApiClientError } from './api-client';
+import { apiFetch, fetchCreator, fetchCreators, fetchFreelancers, fetchFreelancer, ApiClientError } from './api-client';
 import { apiSuccess, apiFailure } from './api-models';
 
 function mockFetch(body: unknown, status = 200) {
@@ -122,5 +122,40 @@ describe('ApiClientError', () => {
   it('network() returns SERVICE_UNAVAILABLE', () => {
     const err = ApiClientError.network();
     expect(err.code).toBe('SERVICE_UNAVAILABLE');
+  });
+});
+
+describe('fetchFreelancers', () => {
+  it('calls /api/freelancers without params', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve(apiSuccess({ freelancers: [], total: 0 })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchFreelancers();
+    expect((fetchMock.mock.calls[0] as [string])[0]).toContain('/api/freelancers');
+  });
+
+  it('appends discipline param', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve(apiSuccess({ freelancers: [], total: 0 })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchFreelancers({ discipline: 'Writing' });
+    expect((fetchMock.mock.calls[0] as [string])[0]).toContain('discipline=Writing');
+  });
+});
+
+describe('fetchFreelancer', () => {
+  it('calls the correct endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve(apiSuccess({ address: 'wallet-1', name: 'Jane' })),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await fetchFreelancer('wallet-1') as { address: string };
+    expect(result.address).toBe('wallet-1');
+    expect((fetchMock.mock.calls[0] as [string])[0]).toContain('/api/freelancers/wallet-1');
   });
 });

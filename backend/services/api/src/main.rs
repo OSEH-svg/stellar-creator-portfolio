@@ -198,11 +198,13 @@ fn error_response(status: actix_web::http::StatusCode, code: ApiErrorCode, messa
 
 /// Health check endpoint
 async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "stellar-api",
-        "version": "0.1.0"
-    }))
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(serde_json::json!({
+            "status": "healthy",
+            "service": "stellar-api",
+            "version": "0.1.0"
+        }))
 }
 
 /// Create a new bounty
@@ -210,6 +212,21 @@ async fn create_bounty(
     body: web::Json<BountyRequest>,
 ) -> HttpResponse {
     tracing::info!("Creating bounty: {:?}", body.title);
+
+    if body.title.trim().is_empty() {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            ApiErrorCode::ValidationError,
+            "title is required",
+        );
+    }
+    if body.budget <= 0 {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            ApiErrorCode::ValidationError,
+            "budget must be positive",
+        );
+    }
 
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
         serde_json::json!({
@@ -222,7 +239,9 @@ async fn create_bounty(
         Some("Bounty created successfully".to_string()),
     );
 
-    HttpResponse::Created().json(response)
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// List all bounties
@@ -239,7 +258,9 @@ async fn list_bounties() -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Get bounty by ID
@@ -256,7 +277,9 @@ async fn get_bounty(path: web::Path<u64>) -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Apply for a bounty
@@ -277,7 +300,9 @@ async fn apply_for_bounty(
         Some("Application submitted successfully".to_string()),
     );
 
-    HttpResponse::Created().json(response)
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Register freelancer
@@ -285,6 +310,14 @@ async fn register_freelancer(
     body: web::Json<FreelancerRegistration>,
 ) -> HttpResponse {
     tracing::info!("Registering freelancer: {}", body.name);
+
+    if body.name.trim().is_empty() {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            ApiErrorCode::ValidationError,
+            "name is required",
+        );
+    }
 
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
         serde_json::json!({
@@ -296,7 +329,9 @@ async fn register_freelancer(
         Some("Freelancer registered successfully".to_string()),
     );
 
-    HttpResponse::Created().json(response)
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// List freelancers
@@ -313,7 +348,9 @@ async fn list_freelancers(query: web::Query<std::collections::HashMap<String, St
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Get freelancer profile
@@ -332,7 +369,9 @@ async fn get_freelancer(path: web::Path<String>) -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// List creators with optional filter by discipline
@@ -456,7 +495,9 @@ async fn list_creators(query: web::Query<std::collections::HashMap<String, Strin
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Get a specific creator by ID
@@ -497,7 +538,9 @@ async fn get_creator(path: web::Path<String>) -> HttpResponse {
     match creator {
         Some(c) => {
             let response: ApiResponse<Creator> = ApiResponse::ok(c, None);
-            HttpResponse::Ok().json(response)
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .json(response)
         }
         None => {
             let response: ApiResponse<Creator> =
@@ -526,7 +569,9 @@ async fn get_creator_reputation(path: web::Path<String>) -> HttpResponse {
 
     let response: ApiResponse<reputation::CreatorReputationPayload> =
         ApiResponse::ok(payload, None);
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Escape escrow
@@ -543,7 +588,9 @@ async fn get_escrow(path: web::Path<u64>) -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Release escrow funds
@@ -560,7 +607,9 @@ async fn release_escrow(path: web::Path<u64>) -> HttpResponse {
         Some("Funds released successfully".to_string()),
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 // ==================== CORS ====================

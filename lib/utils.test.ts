@@ -5,6 +5,9 @@ import {
   formatRelativeDate,
   formatDeadline,
   capitalise,
+  formatRating,
+  formatExperience,
+  truncate,
 } from './utils';
 
 describe('formatCurrency', () => {
@@ -104,5 +107,51 @@ describe('capitalise', () => {
 
   it('handles empty string', () => {
     expect(capitalise('')).toBe('');
+  });
+});
+
+describe('formatRating', () => {
+  it('formats rating with review count', () => {
+    expect(formatRating(4.8, 82)).toBe('4.8 / 5 (82)');
+  });
+
+  it('formats rating without review count', () => {
+    expect(formatRating(4.5)).toBe('4.5 / 5');
+  });
+
+  it('returns no ratings message when undefined', () => {
+    expect(formatRating(undefined)).toBe('No ratings yet');
+  });
+});
+
+describe('formatExperience', () => {
+  it('formats plural years', () => {
+    expect(formatExperience(8)).toBe('8 yrs exp');
+  });
+
+  it('formats singular year', () => {
+    expect(formatExperience(1)).toBe('1 yr exp');
+  });
+
+  it('returns < 1 yr for zero', () => {
+    expect(formatExperience(0)).toBe('< 1 yr exp');
+  });
+
+  it('returns < 1 yr for undefined', () => {
+    expect(formatExperience(undefined)).toBe('< 1 yr exp');
+  });
+});
+
+describe('truncate', () => {
+  it('returns string unchanged when within limit', () => {
+    expect(truncate('hello', 10)).toBe('hello');
+  });
+
+  it('truncates and appends ellipsis', () => {
+    expect(truncate('hello world', 5)).toBe('hello…');
+  });
+
+  it('does not truncate at exact length', () => {
+    expect(truncate('hello', 5)).toBe('hello');
   });
 });
