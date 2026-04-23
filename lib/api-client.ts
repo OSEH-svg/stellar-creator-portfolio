@@ -14,6 +14,7 @@ import {
   type ApiResponse,
   type ApiError,
   type ApiErrorCode,
+  type Bounty,
   type Creator,
   type CreatorReputationPayload,
   type PaginatedData,
@@ -165,14 +166,21 @@ export async function fetchBounties(params?: {
   limit?: number;
   category?: string;
   difficulty?: string;
-}): Promise<PaginatedData<unknown>> {
+  status?: string;
+}): Promise<PaginatedData<Bounty>> {
   const qs = new URLSearchParams();
   if (params?.page) qs.set('page', String(params.page));
   if (params?.limit) qs.set('limit', String(params.limit));
   if (params?.category) qs.set('category', params.category);
   if (params?.difficulty) qs.set('difficulty', params.difficulty);
+  if (params?.status) qs.set('status', params.status);
   const query = qs.toString() ? `?${qs}` : '';
   return apiFetch(`/api/bounties${query}`);
+}
+
+/** GET /api/bounties/:id */
+export async function fetchBounty(id: string): Promise<Bounty> {
+  return apiFetch(`/api/bounties/${id}`);
 }
 
 /** GET /api/freelancers — optionally filter by discipline. */

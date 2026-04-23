@@ -219,6 +219,29 @@ export function validateEscrowTransaction(
   return errors.length > 0 ? errors : null;
 }
 
+// ── Bounty (mirrors Rust Bounty struct) ──────────────────────────────────────
+
+export type BountyStatus = 'open' | 'in-progress' | 'completed' | 'disputed' | 'cancelled';
+export type BountyDifficulty = 'beginner' | 'intermediate' | 'advanced' | 'expert';
+
+export interface Bounty {
+  id: string;
+  title: string;
+  description: string;
+  budget: number;
+  currency: string;
+  deadline: string; // ISO date string from API
+  difficulty: BountyDifficulty;
+  category: string;
+  tags: string[];
+  applicants: number;
+  status: BountyStatus;
+  requiredSkills: string[];
+  deliverables: string;
+  creatorAddress?: string;
+  escrowId?: string;
+}
+
 // ── Creator (mirrors Rust Creator struct) ─────────────────────────────────────
 
 export interface Creator {
