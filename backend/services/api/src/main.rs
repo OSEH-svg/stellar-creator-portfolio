@@ -188,13 +188,23 @@ pub struct CreatorStats {
 
 // ==================== Routes ====================
 
+/// Shared helper: build a consistent JSON error response.
+fn error_response(status: actix_web::http::StatusCode, code: ApiErrorCode, message: &str) -> HttpResponse {
+    let body: ApiResponse<()> = ApiResponse::err(ApiError::new(code, message));
+    HttpResponse::build(status)
+        .content_type("application/json")
+        .json(body)
+}
+
 /// Health check endpoint
 async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "stellar-api",
-        "version": "0.1.0"
-    }))
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(serde_json::json!({
+            "status": "healthy",
+            "service": "stellar-api",
+            "version": "0.1.0"
+        }))
 }
 
 /// Create a new bounty
@@ -202,6 +212,21 @@ async fn create_bounty(
     body: web::Json<BountyRequest>,
 ) -> HttpResponse {
     tracing::info!("Creating bounty: {:?}", body.title);
+
+    if body.title.trim().is_empty() {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            ApiErrorCode::ValidationError,
+            "title is required",
+        );
+    }
+    if body.budget <= 0 {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            ApiErrorCode::ValidationError,
+            "budget must be positive",
+        );
+    }
 
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
         serde_json::json!({
@@ -214,7 +239,9 @@ async fn create_bounty(
         Some("Bounty created successfully".to_string()),
     );
 
-    HttpResponse::Created().json(response)
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// List all bounties
@@ -231,7 +258,9 @@ async fn list_bounties() -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Get bounty by ID
@@ -248,7 +277,9 @@ async fn get_bounty(path: web::Path<u64>) -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Apply for a bounty
@@ -269,7 +300,9 @@ async fn apply_for_bounty(
         Some("Application submitted successfully".to_string()),
     );
 
-    HttpResponse::Created().json(response)
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Register freelancer
@@ -277,6 +310,14 @@ async fn register_freelancer(
     body: web::Json<FreelancerRegistration>,
 ) -> HttpResponse {
     tracing::info!("Registering freelancer: {}", body.name);
+
+    if body.name.trim().is_empty() {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            ApiErrorCode::ValidationError,
+            "name is required",
+        );
+    }
 
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
         serde_json::json!({
@@ -288,7 +329,9 @@ async fn register_freelancer(
         Some("Freelancer registered successfully".to_string()),
     );
 
-    HttpResponse::Created().json(response)
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// List freelancers
@@ -305,7 +348,9 @@ async fn list_freelancers(query: web::Query<std::collections::HashMap<String, St
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Get freelancer profile
@@ -324,7 +369,9 @@ async fn get_freelancer(path: web::Path<String>) -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// List creators with optional filter by discipline
@@ -448,7 +495,9 @@ async fn list_creators(query: web::Query<std::collections::HashMap<String, Strin
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Get a specific creator by ID
@@ -489,12 +538,16 @@ async fn get_creator(path: web::Path<String>) -> HttpResponse {
     match creator {
         Some(c) => {
             let response: ApiResponse<Creator> = ApiResponse::ok(c, None);
-            HttpResponse::Ok().json(response)
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .json(response)
         }
         None => {
             let response: ApiResponse<Creator> =
                 ApiResponse::err(ApiError::not_found(format!("Creator {}", creator_id)));
-            HttpResponse::NotFound().json(response)
+            HttpResponse::NotFound()
+                .content_type("application/json")
+                .json(response)
         }
     }
 }
@@ -516,7 +569,9 @@ async fn get_creator_reputation(path: web::Path<String>) -> HttpResponse {
 
     let response: ApiResponse<reputation::CreatorReputationPayload> =
         ApiResponse::ok(payload, None);
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Escape escrow
@@ -533,7 +588,9 @@ async fn get_escrow(path: web::Path<u64>) -> HttpResponse {
         None,
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 /// Release escrow funds
@@ -550,7 +607,9 @@ async fn release_escrow(path: web::Path<u64>) -> HttpResponse {
         Some("Funds released successfully".to_string()),
     );
 
-    HttpResponse::Ok().json(response)
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(response)
 }
 
 // ==================== CORS ====================
@@ -845,6 +904,21 @@ mod tests {
         let req = awtest::TestRequest::get()
             .uri("/api/creators/alex-studio/reputation")
             .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["creatorId"], "alex-studio");
+        let total = json["data"]["aggregation"]["totalReviews"].as_u64().unwrap();
+        assert!(total >= 1);
+        let avg = json["data"]["aggregation"]["averageRating"].as_f64().unwrap();
+        assert!(avg > 0.0);
+        assert!(json["data"]["recentReviews"].as_array().unwrap().len() >= 1);
+    }
+
+    #[actix_web::test]
     async fn escrow_get_integration_returns_active_payload() {
         use actix_web::test as awtest;
 
@@ -860,12 +934,8 @@ mod tests {
         let body = awtest::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], true);
-        assert_eq!(json["data"]["creatorId"], "alex-studio");
-        let total = json["data"]["aggregation"]["totalReviews"].as_u64().unwrap();
-        assert!(total >= 1);
-        let avg = json["data"]["aggregation"]["averageRating"].as_f64().unwrap();
-        assert!(avg > 0.0);
-        assert!(json["data"]["recentReviews"].as_array().unwrap().len() >= 1);
+        assert_eq!(json["data"]["id"], 7);
+        assert_eq!(json["data"]["status"], "active");
     }
 
     #[actix_web::test]
@@ -882,8 +952,14 @@ mod tests {
 
         let req = awtest::TestRequest::get()
             .uri("/api/creators/unknown-creator/reputation")
-        assert_eq!(json["data"]["id"], 7);
-        assert_eq!(json["data"]["status"], "active");
+            .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["aggregation"]["totalReviews"], 0);
+        assert_eq!(json["data"]["aggregation"]["averageRating"], 0.0);
     }
 
     #[actix_web::test]
@@ -903,8 +979,6 @@ mod tests {
 
         let body = awtest::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["data"]["aggregation"]["totalReviews"], 0);
-        assert_eq!(json["data"]["aggregation"]["averageRating"], 0.0);
         assert_eq!(json["success"], true);
         assert_eq!(json["data"]["status"], "released");
         assert!(json["data"]["transaction_id"].is_string());
