@@ -147,3 +147,26 @@ export interface CreatorReputationPayload {
   aggregation: ReputationAggregation;
   recentReviews: PublicReview[];
 }
+
+// ── Creator (mirrors Rust Creator struct) ─────────────────────────────────────
+
+export interface Creator {
+  id: string;
+  name: string;
+  title: string;
+  discipline: string;
+  bio: string;
+  avatar: string;
+  coverImage: string;
+  tagline: string;
+  linkedIn: string;
+  twitter: string;
+  portfolio?: string;
+  skills: string[];
+  stats?: { projects: number; clients: number; experience: number };
+  hourlyRate?: number;
+  responseTime?: string;
+  availability?: 'available' | 'limited' | 'unavailable';
+  rating?: number;
+  reviewCount?: number;
+}

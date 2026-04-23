@@ -377,6 +377,37 @@ export const getCreatorsByDiscipline = (discipline: string): Creator[] => {
   return creators.filter(creator => creator.discipline === discipline);
 };
 
+/**
+ * Search creators by name, bio, or skills.
+ * Optionally also filter by discipline.
+ */
+export const searchCreators = (query: string, discipline?: string): Creator[] => {
+  const q = query.toLowerCase();
+  return creators.filter(creator => {
+    const matchesDiscipline = !discipline || discipline === 'All' || creator.discipline === discipline;
+    const matchesQuery =
+      !q ||
+      creator.name.toLowerCase().includes(q) ||
+      creator.bio.toLowerCase().includes(q) ||
+      creator.skills.some(s => s.toLowerCase().includes(q));
+    return matchesDiscipline && matchesQuery;
+  });
+};
+
+/** Format availability status for display. */
+export const formatAvailability = (availability?: Creator['availability']): string => {
+  switch (availability) {
+    case 'available': return 'Available now';
+    case 'limited': return 'Limited availability';
+    case 'unavailable': return 'Unavailable';
+    default: return 'Status unknown';
+  }
+};
+
+/** Format a budget number as a USD string. */
+export const formatBudget = (budget: number, currency = 'USD'): string =>
+  new Intl.NumberFormat('en-US', { style: 'currency', currency, maximumFractionDigits: 0 }).format(budget);
+
 export const getBountiesByCategory = (category: string): Bounty[] => {
   if (category === 'All') return bounties;
   return bounties.filter(bounty => bounty.category === category);

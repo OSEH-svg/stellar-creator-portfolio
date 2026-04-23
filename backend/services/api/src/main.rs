@@ -188,6 +188,14 @@ pub struct CreatorStats {
 
 // ==================== Routes ====================
 
+/// Shared helper: build a consistent JSON error response.
+fn error_response(status: actix_web::http::StatusCode, code: ApiErrorCode, message: &str) -> HttpResponse {
+    let body: ApiResponse<()> = ApiResponse::err(ApiError::new(code, message));
+    HttpResponse::build(status)
+        .content_type("application/json")
+        .json(body)
+}
+
 /// Health check endpoint
 async fn health() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
@@ -494,7 +502,9 @@ async fn get_creator(path: web::Path<String>) -> HttpResponse {
         None => {
             let response: ApiResponse<Creator> =
                 ApiResponse::err(ApiError::not_found(format!("Creator {}", creator_id)));
-            HttpResponse::NotFound().json(response)
+            HttpResponse::NotFound()
+                .content_type("application/json")
+                .json(response)
         }
     }
 }
@@ -845,6 +855,21 @@ mod tests {
         let req = awtest::TestRequest::get()
             .uri("/api/creators/alex-studio/reputation")
             .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["creatorId"], "alex-studio");
+        let total = json["data"]["aggregation"]["totalReviews"].as_u64().unwrap();
+        assert!(total >= 1);
+        let avg = json["data"]["aggregation"]["averageRating"].as_f64().unwrap();
+        assert!(avg > 0.0);
+        assert!(json["data"]["recentReviews"].as_array().unwrap().len() >= 1);
+    }
+
+    #[actix_web::test]
     async fn escrow_get_integration_returns_active_payload() {
         use actix_web::test as awtest;
 
@@ -860,12 +885,8 @@ mod tests {
         let body = awtest::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], true);
-        assert_eq!(json["data"]["creatorId"], "alex-studio");
-        let total = json["data"]["aggregation"]["totalReviews"].as_u64().unwrap();
-        assert!(total >= 1);
-        let avg = json["data"]["aggregation"]["averageRating"].as_f64().unwrap();
-        assert!(avg > 0.0);
-        assert!(json["data"]["recentReviews"].as_array().unwrap().len() >= 1);
+        assert_eq!(json["data"]["id"], 7);
+        assert_eq!(json["data"]["status"], "active");
     }
 
     #[actix_web::test]
@@ -882,8 +903,14 @@ mod tests {
 
         let req = awtest::TestRequest::get()
             .uri("/api/creators/unknown-creator/reputation")
-        assert_eq!(json["data"]["id"], 7);
-        assert_eq!(json["data"]["status"], "active");
+            .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["aggregation"]["totalReviews"], 0);
+        assert_eq!(json["data"]["aggregation"]["averageRating"], 0.0);
     }
 
     #[actix_web::test]
@@ -903,8 +930,6 @@ mod tests {
 
         let body = awtest::read_body(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["data"]["aggregation"]["totalReviews"], 0);
-        assert_eq!(json["data"]["aggregation"]["averageRating"], 0.0);
         assert_eq!(json["success"], true);
         assert_eq!(json["data"]["status"], "released");
         assert!(json["data"]["transaction_id"].is_string());
