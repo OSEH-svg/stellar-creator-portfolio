@@ -283,6 +283,55 @@ mod tests {
     }
 
     #[test]
+    fn to_public_review_maps_fields() {
+        let r = Review {
+            id: "r-1".into(),
+            creator_id: "c-1".into(),
+            rating: 4,
+            title: "Good".into(),
+            body: "Nice.".into(),
+            reviewer_name: "Bob".into(),
+            created_at: "2025-01-01".into(),
+        };
+        let p = to_public_review(&r);
+        assert_eq!(p.id, "r-1");
+        assert_eq!(p.rating, 4);
+        assert_eq!(p.reviewer_name, "Bob");
+    }
+
+    #[test]
+    fn recent_reviews_respects_limit() {
+        let revs = sample_reviews();
+        let recent = recent_reviews(&revs, 1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, "a");
+    }
+
+    #[test]
+    fn aggregate_single_review() {
+        let reviews = vec![Review {
+            id: "x".into(),
+            creator_id: "c1".into(),
+            rating: 3,
+            title: "".into(),
+            body: "".into(),
+            reviewer_name: "".into(),
+            created_at: "2025-01-01".into(),
+        }];
+        let agg = aggregate_reviews(&reviews);
+        assert_eq!(agg.total_reviews, 1);
+        assert_eq!(agg.average_rating, 3.0);
+        assert_eq!(agg.stars_3, 1);
+        assert_eq!(agg.stars_5, 0);
+    }
+
+    #[test]
+    fn reviews_for_creator_returns_only_matching() {
+        let all = reviews_for_creator("alex-studio");
+        assert!(all.iter().all(|r| r.creator_id == "alex-studio"));
+    }
+
+    #[test]
     fn seed_covers_profile_creator_ids() {
         let ids = ["alex-studio", "maya-writes", "jordan-creative", "sophia-ux"];
         for id in ids {

@@ -134,6 +134,19 @@ pub struct BountyApplication {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ReviewSubmission {
+    #[serde(rename = "bountyId")]
+    pub bounty_id: String,
+    #[serde(rename = "creatorId")]
+    pub creator_id: String,
+    pub rating: u8,
+    pub title: String,
+    pub body: String,
+    #[serde(rename = "reviewerName")]
+    pub reviewer_name: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct FreelancerRegistration {
     pub name: String,
     pub discipline: String,
@@ -621,6 +634,50 @@ async fn get_creator_reputation(path: web::Path<String>) -> HttpResponse {
         .json(response)
 }
 
+/// Submit a review after bounty completion.
+async fn submit_review(body: web::Json<ReviewSubmission>) -> HttpResponse {
+    tracing::info!("Submitting review for creator: {}", body.creator_id);
+
+    let mut field_errors: Vec<FieldError> = Vec::new();
+    if body.bounty_id.trim().is_empty() {
+        field_errors.push(FieldError { field: "bountyId".into(), message: "Bounty ID is required".into() });
+    }
+    if body.creator_id.trim().is_empty() {
+        field_errors.push(FieldError { field: "creatorId".into(), message: "Creator ID is required".into() });
+    }
+    if !(1..=5).contains(&body.rating) {
+        field_errors.push(FieldError { field: "rating".into(), message: "Rating must be between 1 and 5".into() });
+    }
+    if body.title.trim().is_empty() {
+        field_errors.push(FieldError { field: "title".into(), message: "Title is required".into() });
+    }
+    if body.body.trim().is_empty() {
+        field_errors.push(FieldError { field: "body".into(), message: "Feedback is required".into() });
+    }
+    if body.reviewer_name.trim().is_empty() {
+        field_errors.push(FieldError { field: "reviewerName".into(), message: "Your name is required".into() });
+    }
+    if !field_errors.is_empty() {
+        let resp: ApiResponse<()> = ApiResponse::err(ApiError::with_field_errors(
+            ApiErrorCode::ValidationError,
+            "Validation failed",
+            field_errors,
+        ));
+        return HttpResponse::UnprocessableEntity()
+            .content_type("application/json")
+            .json(resp);
+    }
+
+    let review_id = format!("rev-{}-{}", body.creator_id, body.bounty_id);
+    let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
+        serde_json::json!({ "reviewId": review_id }),
+        Some("Review submitted successfully".to_string()),
+    );
+    HttpResponse::Created()
+        .content_type("application/json")
+        .json(response)
+}
+
 /// Escape escrow
 async fn get_escrow(path: web::Path<u64>) -> HttpResponse {
     let escrow_id = path.into_inner();
@@ -729,6 +786,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/creators", web::get().to(list_creators))
             .route("/api/creators/{id}", web::get().to(get_creator))
             .route("/api/creators/{id}/reputation", web::get().to(get_creator_reputation))
+            .route("/api/reviews", web::post().to(submit_review))
             .route("/api/freelancers", web::get().to(list_freelancers))
             .route("/api/freelancers/{address}", web::get().to(get_freelancer))
             .route("/api/escrow/{id}", web::get().to(get_escrow))
@@ -1335,6 +1393,95 @@ mod tests {
             .map(|e| e["field"].as_str().unwrap())
             .collect();
         assert!(fields.contains(&"proposal"));
+    }
+
+    // ── submit_review ─────────────────────────────────────────────────────────
+
+    fn build_review_app() -> actix_web::App<
+        impl actix_web::dev::ServiceFactory<
+            actix_web::dev::ServiceRequest,
+            Config = (),
+            Response = actix_web::dev::ServiceResponse,
+            Error = actix_web::Error,
+            InitError = (),
+        >,
+    > {
+        App::new().route("/api/reviews", web::post().to(submit_review))
+    }
+
+    #[actix_web::test]
+    async fn submit_review_valid_returns_201_with_review_id() {
+        use actix_web::test as awtest;
+        let app = awtest::init_service(build_review_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/reviews")
+            .set_json(serde_json::json!({
+                "bountyId": "b-1",
+                "creatorId": "alex-studio",
+                "rating": 5,
+                "title": "Excellent work",
+                "body": "Delivered on time and exceeded expectations.",
+                "reviewerName": "Jane D."
+            }))
+            .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::CREATED);
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+        assert!(json["data"]["reviewId"].is_string());
+    }
+
+    #[actix_web::test]
+    async fn submit_review_missing_fields_returns_422_with_all_errors() {
+        use actix_web::test as awtest;
+        let app = awtest::init_service(build_review_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/reviews")
+            .set_json(serde_json::json!({
+                "bountyId": "",
+                "creatorId": "",
+                "rating": 0,
+                "title": "",
+                "body": "",
+                "reviewerName": ""
+            }))
+            .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::UNPROCESSABLE_ENTITY);
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error"]["code"], "VALIDATION_ERROR");
+        let count = json["error"]["fieldErrors"].as_array().unwrap().len();
+        assert_eq!(count, 6);
+    }
+
+    #[actix_web::test]
+    async fn submit_review_rating_out_of_range_returns_422() {
+        use actix_web::test as awtest;
+        let app = awtest::init_service(build_review_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/reviews")
+            .set_json(serde_json::json!({
+                "bountyId": "b-1",
+                "creatorId": "c-1",
+                "rating": 6,
+                "title": "Good",
+                "body": "Nice work.",
+                "reviewerName": "Alice"
+            }))
+            .to_request();
+        let resp = awtest::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::UNPROCESSABLE_ENTITY);
+        let body = awtest::read_body(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let fields: Vec<&str> = json["error"]["fieldErrors"]
+            .as_array().unwrap()
+            .iter()
+            .map(|e| e["field"].as_str().unwrap())
+            .collect();
+        assert!(fields.contains(&"rating"));
     }
 
     #[actix_web::test]
