@@ -172,6 +172,81 @@ pub struct ReviewSubmission {
     pub reviewer_name: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct EscrowCreateRequest {
+    #[serde(rename = "bountyId")]
+    pub bounty_id: String,
+    #[serde(rename = "payerAddress")]
+    pub payer_address: String,
+    #[serde(rename = "payeeAddress")]
+    pub payee_address: String,
+    pub amount: i64,
+    pub token: String,
+    #[allow(dead_code)]
+    pub timelock: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct EscrowRefundRequest {
+    #[serde(rename = "authorizerAddress")]
+    #[allow(dead_code)]
+    pub authorizer_address: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct FreelancerRegistration {
+    pub name: String,
+    pub discipline: String,
+    pub bio: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Project {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub category: String,
+    pub image: String,
+    pub link: Option<String>,
+    pub tags: Vec<String>,
+    pub year: i32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Creator {
+    pub id: String,
+    pub name: String,
+    pub title: String,
+    pub discipline: String,
+    pub bio: String,
+    pub avatar: String,
+    #[serde(rename = "coverImage")]
+    pub cover_image: String,
+    pub tagline: String,
+    #[serde(rename = "linkedIn")]
+    pub linked_in: String,
+    pub twitter: String,
+    pub portfolio: Option<String>,
+    pub projects: Vec<Project>,
+    pub skills: Vec<String>,
+    pub stats: Option<CreatorStats>,
+    #[serde(rename = "hourlyRate")]
+    pub hourly_rate: Option<i32>,
+    #[serde(rename = "responseTime")]
+    pub response_time: Option<String>,
+    pub availability: Option<String>,
+    pub rating: Option<f32>,
+    #[serde(rename = "reviewCount")]
+    pub review_count: Option<i32>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct CreatorStats {
+    pub projects: i32,
+    pub clients: i32,
+    pub experience: i32,
+}
+
 // ==================== Routes ====================
 
 /// Health check endpoint
@@ -1358,8 +1433,14 @@ mod tests {
         >,
     > {
         App::new().service(
-            web::scope("")
+            web::scope("/api/v1")
                 .wrap(auth::JwtMiddleware)
+                .route("/bounties", web::post().to(create_bounty))
+                .route("/bounties/{id}/apply", web::post().to(apply_for_bounty))
+                .route("/freelancers/register", web::post().to(register_freelancer))
+                .route("/escrow/create", web::post().to(create_escrow))
+                .route("/escrow/{id}/release", web::post().to(release_escrow))
+                .route("/escrow/{id}/refund", web::post().to(refund_escrow))
                 .route("/api/bounties", web::post().to(create_bounty))
                 .route("/api/bounties/{id}/apply", web::post().to(apply_for_bounty))
                 .route(
@@ -1830,6 +1911,8 @@ mod tests {
         >,
     > {
         App::new()
+            .route("/api/v1/escrow/create", web::post().to(create_escrow))
+            .route("/api/v1/escrow/{id}/refund", web::post().to(refund_escrow))
             .route("/api/v1/creators/{id}/reviews", web::get().to(get_creator_reviews_filtered))
             .route("/api/v1/reviews", web::get().to(list_reviews_filtered))
     }
@@ -1837,6 +1920,18 @@ mod tests {
     #[actix_web::test]
     async fn get_creator_reviews_filtered_returns_paginated_results() {
         use actix_web::test as awtest;
+        std::env::remove_var("JWT_SECRET");
+
+        let app = awtest::init_service(build_protected_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/v1/escrow/create")
+            .set_json(serde_json::json!({
+                "bountyId": "b-1",
+                "payerAddress": "GPAYER",
+                "payeeAddress": "GPAYEE",
+                "amount": 1000,
+                "token": "GUSDC"
+            }))
         let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
@@ -1870,6 +1965,20 @@ mod tests {
     #[actix_web::test]
     async fn get_creator_reviews_filtered_with_rating_filter() {
         use actix_web::test as awtest;
+        std::env::remove_var("JWT_SECRET");
+        let token = auth::tests::make_token("wallet-1", "creator", 3600);
+
+        let app = awtest::init_service(build_protected_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/v1/escrow/create")
+            .insert_header(("Authorization", format!("Bearer {}", token)))
+            .set_json(serde_json::json!({
+                "bountyId": "b-1",
+                "payerAddress": "GPAYER",
+                "payeeAddress": "GPAYEE",
+                "amount": 2500,
+                "token": "GUSDC"
+            }))
         let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
@@ -1893,6 +2002,16 @@ mod tests {
     #[actix_web::test]
     async fn get_creator_reviews_filtered_invalid_params_returns_422() {
         use actix_web::test as awtest;
+        let app = awtest::init_service(build_escrow_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/v1/escrow/create")
+            .set_json(serde_json::json!({
+                "bountyId": "",
+                "payerAddress": "",
+                "payeeAddress": "",
+                "amount": 0,
+                "token": ""
+            }))
         let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
@@ -1915,6 +2034,16 @@ mod tests {
     #[actix_web::test]
     async fn list_reviews_filtered_returns_all_reviews() {
         use actix_web::test as awtest;
+        let app = awtest::init_service(build_escrow_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/v1/escrow/create")
+            .set_json(serde_json::json!({
+                "bountyId": "b-1",
+                "payerAddress": "GPAYER",
+                "payeeAddress": "GPAYEE",
+                "amount": -100,
+                "token": "GUSDC"
+            }))
         let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
@@ -1945,7 +2074,7 @@ mod tests {
 
         let app = awtest::init_service(build_protected_app()).await;
         let req = awtest::TestRequest::post()
-            .uri("/api/escrow/5/refund")
+            .uri("/api/v1/escrow/5/refund")
             .set_json(serde_json::json!({ "authorizerAddress": "GPAYER" }))
             .to_request();
         let resp = awtest::call_service(&app, req).await;
@@ -1968,6 +2097,14 @@ mod tests {
     #[actix_web::test]
     async fn list_reviews_filtered_with_verified_only() {
         use actix_web::test as awtest;
+        std::env::remove_var("JWT_SECRET");
+        let token = auth::tests::make_token("wallet-1", "creator", 3600);
+
+        let app = awtest::init_service(build_protected_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/v1/escrow/5/refund")
+            .insert_header(("Authorization", format!("Bearer {}", token)))
+            .set_json(serde_json::json!({ "authorizerAddress": "GPAYER123" }))
         let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
@@ -1994,6 +2131,10 @@ mod tests {
     #[actix_web::test]
     async fn list_reviews_filtered_date_range() {
         use actix_web::test as awtest;
+        let app = awtest::init_service(build_escrow_app()).await;
+        let req = awtest::TestRequest::post()
+            .uri("/api/v1/escrow/5/refund")
+            .set_json(serde_json::json!({ "authorizerAddress": "" }))
         let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
