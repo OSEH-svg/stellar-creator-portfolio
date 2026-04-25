@@ -282,8 +282,10 @@ export interface Bounty {
   category: string;
   tags: string[];
   applicants: number;
-  status: 'open' | 'in-progress' | 'completed' | 'cancelled';
+  status: 'open' | 'in-progress' | 'completed' | 'cancelled' | 'disputed';
   postedBy: string;
+  creatorAddress?: string;
+  escrowId?: string;
   postedDate: Date;
   requiredSkills: string[];
   deliverables: string;
@@ -315,6 +317,7 @@ export const bounties: Bounty[] = [
     applicants: 12,
     status: 'open',
     postedBy: 'company-1',
+    creatorAddress: 'GCREATOR123...',
     postedDate: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
     requiredSkills: ['Brand Design', 'Logo Design', 'Typography', 'Figma'],
     deliverables: 'Logo files, brand guide PDF, color palette, typography system',
@@ -330,8 +333,10 @@ export const bounties: Bounty[] = [
     category: 'Technical Writing',
     tags: ['API Docs', 'Technical Writing', 'Documentation'],
     applicants: 8,
-    status: 'open',
+    status: 'in-progress',
     postedBy: 'company-2',
+    creatorAddress: 'GCREATOR456...',
+    escrowId: 'esc_77',
     postedDate: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000),
     requiredSkills: ['Technical Writing', 'API Knowledge', 'Markdown'],
     deliverables: 'Complete API documentation, guides, and examples',
@@ -347,8 +352,10 @@ export const bounties: Bounty[] = [
     category: 'Content Creation',
     tags: ['Social Media', 'Content', 'Video', 'Graphics'],
     applicants: 15,
-    status: 'open',
+    status: 'completed',
     postedBy: 'company-3',
+    creatorAddress: 'GCREATOR789...',
+    escrowId: 'esc_92',
     postedDate: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000),
     requiredSkills: ['Video Production', 'Graphic Design', 'Copywriting', 'Social Media'],
     deliverables: 'Content calendar, 60 pieces of content, performance tracking',
@@ -364,8 +371,10 @@ export const bounties: Bounty[] = [
     category: 'UX Research',
     tags: ['UX Research', 'User Testing', 'Mobile App', 'Analytics'],
     applicants: 6,
-    status: 'open',
+    status: 'disputed',
     postedBy: 'company-4',
+    creatorAddress: 'GCREATOR000...',
+    escrowId: 'esc_105',
     postedDate: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
     requiredSkills: ['UX Research', 'User Testing', 'Analysis', 'Reporting'],
     deliverables: 'Research report, testing videos, recommendations, analysis',

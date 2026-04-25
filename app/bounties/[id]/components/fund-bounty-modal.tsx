@@ -108,10 +108,10 @@ export function FundBountyModal({
           {state === 'success' ? (
             <div className="text-center space-y-4">
               <CheckCircle className="w-12 h-12 text-green-500 mx-auto" />
-              <p className="font-semibold text-lg">Funds deposited!</p>
+              <p className="font-semibold text-lg text-foreground">Funds Locked in Escrow</p>
               <p className="text-sm text-muted-foreground">
-                Your deposit for <span className="font-medium">{bountyTitle}</span> is being
-                processed on the Stellar network.
+                Your deposit for <span className="font-medium text-foreground">{bountyTitle}</span> has been
+                confirmed. Funds are now securely held in the Soroban escrow contract.
               </p>
               {txHash && (
                 <a

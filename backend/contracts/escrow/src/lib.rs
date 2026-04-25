@@ -90,6 +90,7 @@ impl EscrowContract {
         };
 
         env.storage().persistent().set(&Symbol::new(&env, &format!("escrow_{}", counter)), &escrow);
+        env.storage().persistent().set(&Symbol::new(&env, &format!("b_esc_{}", bounty_id)), &counter);
         env.storage().persistent().set(&counter_key, &counter);
 
         // Emit escrow_deposited event for indexers
@@ -333,6 +334,14 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .get::<Symbol, u64>(&Symbol::new(&env, "escrow_counter"))
+            .unwrap_or(0)
+    }
+
+    /// Get the latest escrow ID for a specific bounty.
+    pub fn get_escrow_id_for_bounty(env: Env, bounty_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get::<Symbol, u64>(&Symbol::new(&env, &format!("b_esc_{}", bounty_id)))
             .unwrap_or(0)
     }
 
@@ -794,7 +803,7 @@ mod tests {
     }
 
     // ── multi-escrow isolation ────────────────────────────────────────────────
-
+    
     /// Releasing escrow A must not affect escrow B's locked balance.
     #[test]
     fn releasing_one_escrow_does_not_drain_another() {
@@ -817,6 +826,19 @@ mod tests {
 
         // Escrow B is still active and untouched
         assert!(contract.get_escrow(&id_b).status == EscrowStatus::Active);
+    }
+
+    #[test]
+    fn test_get_escrow_id_for_bounty() {
+        let env = Env::default();
+        let (_, token, payer, payee) = setup(&env, 1000);
+        let contract = EscrowContractClient::new(&env, &env.register_contract(None, EscrowContract));
+
+        let b_id = 99u64;
+        let e_id = contract.deposit(&b_id, &payer, &payee, &500, &token, &ReleaseCondition::OnCompletion);
+        
+        assert_eq!(contract.get_escrow_id_for_bounty(&b_id), e_id);
+        assert_eq!(contract.get_escrow_id_for_bounty(&100u64), 0);
     }
 
     /// IDs are monotonically increasing and never reused.

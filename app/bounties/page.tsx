@@ -5,11 +5,13 @@ import { Header } from '@/components/header';
 import { Footer } from '@/components/footer';
 import { Button } from '@/components/ui/button';
 import { bounties, Bounty } from '@/lib/creators-data';
-import { ArrowRight, Filter, Calendar, DollarSign, Zap, X, CheckCircle, Loader2, ExternalLink } from 'lucide-react';
-import { submitEscrowTransaction } from '@/lib/api-client';
+import { ArrowRight, Filter, Calendar, DollarSign, Zap, X, CheckCircle, Loader2, ExternalLink, ShieldCheck } from 'lucide-react';
+import { submitEscrowTransaction, releaseEscrow } from '@/lib/api-client';
 import { validateEscrowTransaction } from '@/lib/api-models';
 import { getErrorMessage } from '@/lib/error-handling';
 import { ApiClientError } from '@/lib/api-client';
+import { useStellarWallet } from '@/hooks/useStellarWallet';
+import { toast } from 'sonner';
 
 // ── Apply Modal ───────────────────────────────────────────────────────────────
 
@@ -209,6 +211,27 @@ function ApplyModal({ bounty, onClose }: { bounty: Bounty; onClose: () => void }
   );
 }
 
+// ── Payment Status ────────────────────────────────────────────────────────────
+
+function PaymentStatusBadge({ status }: { status: string }) {
+  const statusConfig: Record<string, { label: string; color: string }> = {
+    open: { label: 'Accepting Applications', color: 'bg-slate-500/10 text-slate-600 dark:text-slate-400' },
+    'in-progress': { label: 'Payment Locked (Escrow)', color: 'bg-blue-500/20 text-blue-700 dark:text-blue-400' },
+    completed: { label: 'Payment Released', color: 'bg-green-500/20 text-green-700 dark:text-green-400' },
+    cancelled: { label: 'Payment Refunded', color: 'bg-orange-500/20 text-orange-700 dark:text-orange-400' },
+    disputed: { label: 'Payment Disputed', color: 'bg-red-500/20 text-red-700 dark:text-red-400' },
+  };
+
+  const { label, color } = statusConfig[status] || statusConfig.open;
+
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider ${color}`}>
+      <span className="w-1 h-1 rounded-full bg-current opacity-70" />
+      {label}
+    </span>
+  );
+}
+
 // ── Bounty Card ───────────────────────────────────────────────────────────────
 
 const difficultyColor: Record<string, string> = {
@@ -219,13 +242,36 @@ const difficultyColor: Record<string, string> = {
 };
 
 function BountyCard({ bounty, onApply }: { bounty: Bounty; onApply: (b: Bounty) => void }) {
+  const { publicKey } = useStellarWallet();
+  const [isReleasing, setIsReleasing] = useState(false);
   const daysLeft = Math.ceil((bounty.deadline.getTime() - Date.now()) / 86_400_000);
+
+  const isCreator = publicKey && bounty.creatorAddress === publicKey;
+  const canRelease = bounty.status === 'in-progress' && isCreator;
+
+  async function handleRelease() {
+    if (!bounty.escrowId || !publicKey) return;
+    setIsReleasing(true);
+    try {
+      await releaseEscrow(bounty.escrowId, publicKey);
+      toast.success('Funds released successfully!');
+      // In a real app, we would refresh the bounty data here
+    } catch (err) {
+      toast.error('Failed to release funds. Please try again.');
+    } finally {
+      setIsReleasing(false);
+    }
+  }
+
   return (
     <div className="bg-card border border-border rounded-lg p-6 hover:shadow-lg transition-all hover:-translate-y-1">
       <div className="flex items-start justify-between mb-4">
         <div className="flex-1">
           <h3 className="text-xl font-bold text-foreground mb-1 line-clamp-2">{bounty.title}</h3>
-          <p className="text-sm text-muted-foreground">{bounty.category}</p>
+          <div className="flex items-center gap-2">
+            <p className="text-sm text-muted-foreground">{bounty.category}</p>
+            <PaymentStatusBadge status={bounty.status} />
+          </div>
         </div>
         <span className={`px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap ml-4 capitalize ${difficultyColor[bounty.difficulty] ?? 'bg-gray-500/20 text-gray-700'}`}>
           {bounty.difficulty}
@@ -264,10 +310,21 @@ function BountyCard({ bounty, onApply }: { bounty: Bounty; onApply: (b: Bounty) 
           <Zap size={14} className="inline mr-1" />
           {bounty.applicants} applications
         </div>
-        <Button size="sm" onClick={() => onApply(bounty)} className="group">
-          Apply Now
-          <ArrowRight size={14} className="ml-2 group-hover:translate-x-0.5 transition-transform" />
-        </Button>
+        {bounty.status === 'open' ? (
+          <Button size="sm" onClick={() => onApply(bounty)} className="group">
+            Apply Now
+            <ArrowRight size={14} className="ml-2 group-hover:translate-x-0.5 transition-transform" />
+          </Button>
+        ) : canRelease ? (
+          <Button size="sm" onClick={handleRelease} disabled={isReleasing} className="bg-green-600 hover:bg-green-700 text-white">
+            {isReleasing ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} className="mr-2" />}
+            Release Funds
+          </Button>
+        ) : (
+          <div className="text-xs text-muted-foreground font-medium italic">
+            Locked in Escrow
+          </div>
+        )}
       </div>
     </div>
   );
