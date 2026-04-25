@@ -882,23 +882,79 @@ async fn api_versions() -> HttpResponse {
 
 // ==================== CORS ====================
 
-/// Build the CORS middleware from environment configuration.
+/// Parse and validate the CORS origin whitelist from the `CORS_ALLOWED_ORIGINS`
+/// environment variable.
+///
+/// Rules enforced at startup (panics on violation so misconfiguration is caught
+/// immediately rather than silently allowing unsafe access):
+///
+/// - Wildcards (`*`) are **never** permitted — they would re-introduce the
+///   original vulnerability and are incompatible with `supports_credentials()`.
+/// - Every entry must start with `http://` or `https://`; bare hostnames or
+///   other schemes are rejected.
+/// - Empty entries (e.g. trailing commas) are silently dropped.
+///
+/// Falls back to `http://localhost:3000` only when the variable is **absent**,
+/// which is safe for local development.  In production the variable must be
+/// set explicitly.
+pub fn parse_allowed_origins() -> Vec<String> {
+    let raw = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+
+    let origins: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for origin in &origins {
+        // Wildcard origins are explicitly forbidden — they bypass the whitelist
+        // entirely and cannot be combined with credentials.
+        if origin == "*" {
+            panic!(
+                "CORS_ALLOWED_ORIGINS must not contain a wildcard '*'. \
+                 Set explicit origin URLs instead."
+            );
+        }
+
+        // Require a proper scheme so we never accidentally allow bare hostnames
+        // or non-HTTP schemes that could be abused.
+        if !origin.starts_with("http://") && !origin.starts_with("https://") {
+            panic!(
+                "CORS_ALLOWED_ORIGINS entry '{}' is invalid: every origin must \
+                 start with 'http://' or 'https://'.",
+                origin
+            );
+        }
+    }
+
+    if origins.is_empty() {
+        panic!(
+            "CORS_ALLOWED_ORIGINS resolved to an empty list. \
+             Provide at least one allowed origin."
+        );
+    }
+
+    origins
+}
+
+/// Build the CORS middleware from the validated origin whitelist.
 ///
 /// Allowed origins are read from the `CORS_ALLOWED_ORIGINS` environment
-/// variable as a comma-separated list (e.g. `http://localhost:3000,https://app.stellar.dev`).
-/// When the variable is absent the default `http://localhost:3000` is used,
-/// which covers local Next.js development.
+/// variable as a comma-separated list (e.g. `http://localhost:3000,https://app.example.com`).
+/// Wildcards and invalid entries cause an immediate startup panic so that
+/// misconfiguration is never silently deployed.
 ///
 /// All standard HTTP methods and the headers required by a JSON API
 /// (`Content-Type`, `Authorization`, `Accept`) are permitted.
 /// Credentials (cookies / auth headers) are allowed so wallet-auth flows work.
 pub fn cors_middleware() -> Cors {
-    let allowed_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let allowed_origins = parse_allowed_origins();
+
+    tracing::info!(
+        "CORS whitelist: [{}]",
+        allowed_origins.join(", ")
+    );
 
     let mut cors = Cors::default()
         .allowed_methods(vec!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -1097,6 +1153,13 @@ mod tests {
     }
 
     // ── CORS tests ────────────────────────────────────────────────────────────
+    //
+    // These tests verify the whitelist-based CORS policy introduced to fix the
+    // P0 security issue where all origins were permitted.  Key invariants:
+    //   1. Allowed origins receive the correct ACAO header.
+    //   2. Disallowed origins receive no ACAO header.
+    //   3. Wildcard '*' in CORS_ALLOWED_ORIGINS panics at startup.
+    //   4. Invalid (non-HTTP/S) origins panic at startup.
 
     #[test]
     fn test_cors_middleware_builds_with_default_origin() {
@@ -1171,6 +1234,67 @@ mod tests {
             "disallowed origin must not receive ACAO header"
         );
 
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    // Wildcard '*' must be rejected at parse time — it would re-introduce the
+    // original P0 vulnerability and is incompatible with credentials.
+    #[test]
+    #[should_panic(expected = "must not contain a wildcard")]
+    fn test_cors_wildcard_origin_panics() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "*");
+        let _ = parse_allowed_origins();
+    }
+
+    // A wildcard mixed with real origins must also be rejected.
+    #[test]
+    #[should_panic(expected = "must not contain a wildcard")]
+    fn test_cors_mixed_wildcard_panics() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "http://localhost:3000,*");
+        let _ = parse_allowed_origins();
+    }
+
+    // Non-HTTP/S schemes (e.g. bare hostnames, file://) must be rejected.
+    #[test]
+    #[should_panic(expected = "must start with 'http://' or 'https://'")]
+    fn test_cors_invalid_scheme_panics() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "localhost:3000");
+        let _ = parse_allowed_origins();
+    }
+
+    // An empty list after filtering must be rejected.
+    #[test]
+    #[should_panic(expected = "resolved to an empty list")]
+    fn test_cors_empty_origins_panics() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", ",,, ,");
+        let _ = parse_allowed_origins();
+    }
+
+    // Multiple valid origins should all be accepted.
+    #[test]
+    fn test_cors_multiple_valid_origins_accepted() {
+        std::env::set_var(
+            "CORS_ALLOWED_ORIGINS",
+            "http://localhost:3000,https://app.example.com,https://staging.example.com",
+        );
+        let origins = parse_allowed_origins();
+        assert_eq!(origins.len(), 3);
+        assert!(origins.contains(&"http://localhost:3000".to_string()));
+        assert!(origins.contains(&"https://app.example.com".to_string()));
+        assert!(origins.contains(&"https://staging.example.com".to_string()));
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    // Whitespace around entries must be trimmed before validation.
+    #[test]
+    fn test_cors_origins_are_trimmed() {
+        std::env::set_var(
+            "CORS_ALLOWED_ORIGINS",
+            "  http://localhost:3000  ,  https://app.example.com  ",
+        );
+        let origins = parse_allowed_origins();
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains(&"http://localhost:3000".to_string()));
         std::env::remove_var("CORS_ALLOWED_ORIGINS");
     }
 
