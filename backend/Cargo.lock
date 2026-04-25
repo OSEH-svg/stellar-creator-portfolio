@@ -3103,9 +3103,12 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "hex",
+ "hmac",
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
@@ -3208,6 +3211,13 @@ dependencies = [
  "serde",
  "serde_with",
  "stellar-strkey",
+]
+
+[[package]]
+name = "stellar_insights"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
