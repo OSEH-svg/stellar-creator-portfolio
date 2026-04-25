@@ -1,7 +1,5 @@
 #![no_std]
 
-
-
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, String, Symbol};
 
 /// Freelancer Profile
@@ -21,9 +19,6 @@ pub struct FreelancerProfile {
 
 /// Storage key for the contract owner address (set once at init).
 const OWNER_KEY: &str = "owner";
-
-/// Storage key prefix for the public-key → user mapping.
-const PK_MAP_PREFIX: &str = "pk_map_";
 /// Identity Registry Metadata
 #[contracttype]
 pub struct IdentityMetadata {
@@ -67,14 +62,14 @@ impl FreelancerContract {
         let owner = Self::get_owner(&env);
         owner.require_auth();
 
-        let map_key = Symbol::new(&env, &format!("{}{:?}", PK_MAP_PREFIX, public_key));
+        let map_key = (Symbol::new(&env, "pk_map"), public_key.clone());
         env.storage().persistent().set(&map_key, &user);
     }
 
     /// Retrieve the user address associated with a public key.
     pub fn get_user_by_public_key(env: Env, public_key: String) -> Option<Address> {
-        let map_key = Symbol::new(&env, &format!("{}{:?}", PK_MAP_PREFIX, public_key));
-        env.storage().persistent().get::<Symbol, Address>(&map_key)
+        let map_key = (Symbol::new(&env, "pk_map"), public_key);
+        env.storage().persistent().get::<(Symbol, String), Address>(&map_key)
     }
 
     // ── Freelancer registration ───────────────────────────────────────────────
@@ -88,8 +83,6 @@ impl FreelancerContract {
     ) -> bool {
         // #312: caller must authorise this action
         freelancer.require_auth();
-
-        let profile_key = Symbol::new(&env, &format!("profile_{:?}", freelancer));
 
         let profile_key = (Symbol::new(&env, "profile"), freelancer.clone());
         
@@ -113,7 +106,6 @@ impl FreelancerContract {
 
         env.storage().persistent().set(&profile_key, &profile);
 
-        let count_key = Symbol::new(&env, "freelancer_count");
         // Increment freelancers count
         let count_key = Symbol::new(&env, "f_count");
         let count: u32 = env
@@ -141,12 +133,6 @@ impl FreelancerContract {
         let owner = Self::get_owner(&env);
         owner.require_auth();
 
-        let profile_key = Symbol::new(&env, &format!("profile_{:?}", freelancer));
-    pub fn update_rating(
-        env: Env,
-        freelancer: Address,
-        new_rating: u32,
-    ) -> bool {
         let profile_key = (Symbol::new(&env, "profile"), freelancer);
         let mut profile = env
             .storage()
@@ -169,11 +155,6 @@ impl FreelancerContract {
         let owner = Self::get_owner(&env);
         owner.require_auth();
 
-        let profile_key = Symbol::new(&env, &format!("profile_{:?}", freelancer));
-    pub fn update_completed_projects(
-        env: Env,
-        freelancer: Address,
-    ) -> bool {
         let profile_key = (Symbol::new(&env, "profile"), freelancer);
         let mut profile = env
             .storage()
@@ -192,12 +173,6 @@ impl FreelancerContract {
         let owner = Self::get_owner(&env);
         owner.require_auth();
 
-        let profile_key = Symbol::new(&env, &format!("profile_{:?}", freelancer));
-    pub fn update_earnings(
-        env: Env,
-        freelancer: Address,
-        amount: i128,
-    ) -> bool {
         let profile_key = (Symbol::new(&env, "profile"), freelancer);
         let mut profile = env
             .storage()
@@ -216,11 +191,6 @@ impl FreelancerContract {
         let owner = Self::get_owner(&env);
         owner.require_auth();
 
-        let profile_key = Symbol::new(&env, &format!("profile_{:?}", freelancer));
-    pub fn verify_freelancer(
-        env: Env,
-        freelancer: Address,
-    ) -> bool {
         let profile_key = (Symbol::new(&env, "profile"), freelancer);
         let mut profile = env
             .storage()
