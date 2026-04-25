@@ -4,7 +4,6 @@ use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::body::MessageBody;
 use futures::future::{ok, Ready};
 use serde::{Deserialize, Serialize};
-use tracing_subscriber;
 
 mod auth;
 mod reputation;
@@ -226,14 +225,6 @@ pub struct CreatorStats {
 }
 
 // ==================== Routes ====================
-
-/// Shared helper: build a consistent JSON error response.
-fn error_response(status: actix_web::http::StatusCode, code: ApiErrorCode, message: &str) -> HttpResponse {
-    let body: ApiResponse<()> = ApiResponse::err(ApiError::new(code, message));
-    HttpResponse::build(status)
-        .content_type("application/json")
-        .json(body)
-}
 
 /// Health check endpoint
 async fn health() -> HttpResponse {
@@ -1195,7 +1186,7 @@ mod tests {
         assert!(total >= 1);
         let avg = json["data"]["aggregation"]["averageRating"].as_f64().unwrap();
         assert!(avg > 0.0);
-        assert!(json["data"]["recentReviews"].as_array().unwrap().len() >= 1);
+        assert!(!json["data"]["recentReviews"].as_array().unwrap().is_empty());
     }
 
     #[actix_web::test]

@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(agg.stars_5, 1);
         assert_eq!(agg.stars_4, 1);
         assert_eq!(agg.stars_3, 0);
-        assert_eq!(agg.is_verified, false, "need at least 3 reviews");
+        assert!(!agg.is_verified, "need at least 3 reviews");
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
         let agg = aggregate_reviews(&revs);
         assert_eq!(agg.total_reviews, 3);
         assert!(agg.average_rating >= 4.5);
-        assert_eq!(agg.is_verified, true);
+        assert!(agg.is_verified);
     }
 
     #[test]
@@ -468,7 +468,7 @@ mod tests {
         let agg = aggregate_reviews(&reviews_at_threshold);
         assert_eq!(agg.total_reviews, 3);
         assert!((agg.average_rating - 4.67).abs() < 0.01); // Should be 4.67
-        assert_eq!(agg.is_verified, true); // >= 4.5 and >= 3 reviews
+        assert!(agg.is_verified); // >= 4.5 and >= 3 reviews
 
         // Test just below threshold (3 reviews, < 4.5 average)
         let reviews_below_threshold = vec![
@@ -503,6 +503,6 @@ mod tests {
         let agg = aggregate_reviews(&reviews_below_threshold);
         assert_eq!(agg.total_reviews, 3);
         assert!((agg.average_rating - 4.33).abs() < 0.01); // Should be 4.33
-        assert_eq!(agg.is_verified, false); // < 4.5 average
+        assert!(!agg.is_verified); // < 4.5 average
     }
 }

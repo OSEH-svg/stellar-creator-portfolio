@@ -98,7 +98,7 @@ where
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|t| validate_token(t))
+            .map(validate_token)
             .unwrap_or(Err("Missing Authorization header".to_string()));
 
         Box::pin(async move {
@@ -131,7 +131,7 @@ pub mod tests {
 
     /// Generate a signed token for tests (uses the dev secret).
     pub fn make_token(sub: &str, role: &str, exp_offset_secs: i64) -> String {
-        let exp = (chrono_exp(exp_offset_secs)) as u64;
+        let exp = chrono_exp(exp_offset_secs);
         let claims = Claims { sub: sub.to_string(), exp, role: role.to_string() };
         encode(
             &Header::default(),

@@ -4,8 +4,7 @@ extern crate alloc;
 use alloc::format;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec, Map, 
-    IntoVal, FromVal, TryFromVal,
+    contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
 
 /// Bounty Status Enum
@@ -129,7 +128,7 @@ impl BountyContract {
             proposal,
             proposed_budget,
             timeline,
-            status: String::from_slice(&env, "pending"),
+            status: String::from_str(&env, "pending"),
             created_at: env.ledger().timestamp(),
         };
 
@@ -291,8 +290,8 @@ mod tests {
         let contract = BountyContractClient::new(&env, &env.register_contract(None, BountyContract));
 
         let creator = Address::generate(&env);
-        let title = String::from_slice(&env, "Test Bounty");
-        let description = String::from_slice(&env, "Test Description");
+        let title = String::from_str(&env, "Test Bounty");
+        let description = String::from_str(&env, "Test Description");
 
         let bounty_id = contract.create_bounty(
             &creator,
@@ -320,8 +319,8 @@ mod tests {
 
         let bounty_id = contract.create_bounty(
             &creator,
-            &String::from_slice(&env, "Test Bounty"),
-            &String::from_slice(&env, "Test Description"),
+            &String::from_str(&env, "Test Bounty"),
+            &String::from_str(&env, "Test Description"),
             &5000i128,
             &100u64,
         );
@@ -329,7 +328,7 @@ mod tests {
         let app_id = contract.apply_for_bounty(
             &bounty_id,
             &freelancer,
-            &String::from_slice(&env, "I can do this!"),
+            &String::from_str(&env, "I can do this!"),
             &4500i128,
             &30u64,
         );
