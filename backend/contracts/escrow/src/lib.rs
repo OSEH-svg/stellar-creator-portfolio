@@ -366,9 +366,9 @@ impl EscrowContract {
             Self::dispute_escrow(env.clone(), caller.clone(), escrow_id);
         } else if operation == op_deposit {
             // deposit requires additional params; callers should use deposit() directly
-            assert!(false, "Use deposit() directly for new escrows");
+            panic!("Use deposit() directly for new escrows");
         } else {
-            assert!(false, "Unknown operation");
+            panic!("Unknown operation");
         }
 
         // Emit a generic transaction_submitted event for the indexer

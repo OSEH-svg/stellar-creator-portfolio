@@ -1,13 +1,12 @@
-/// Fuzzing tests for the escrow contract
-/// 
-/// These tests use property-based testing and fuzzing strategies to verify:
-/// - Double-spend prevention
-/// - Escrow safety and correctness
-/// - Token balance invariants
-/// - Authorization checks
-
+//! Fuzzing tests for the escrow contract
+//! 
+//! These tests use property-based testing and fuzzing strategies to verify:
+//! - Double-spend prevention
+//! - Escrow safety and correctness
+//! - Token balance invariants
+//! - Authorization checks
 #[cfg(test)]
-mod fuzz_tests {
+mod escrow_fuzz_tests {
     extern crate std;
     use std::panic;
 
