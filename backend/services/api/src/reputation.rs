@@ -303,14 +303,22 @@ async fn save_review_to_database(event: &ReviewSubmittedEvent) -> Result<(), Str
         Ok(_) => {
             tracing::info!("Review {} saved for creator {}", event.review_id, event.creator_id);
             
+            // Calculate current reliability score
+            let reviews = fetch_creator_reviews_from_db(&event.creator_id).await;
+            let reliability_score = compute_reliability_score(&reviews);
+
+            // Update creator reputation aggregation with reliability score
+            let update_result = sqlx::query("SELECT update_creator_reputation($1, $2)")
             let update_result = sqlx::query("SELECT update_creator_reputation($1)")
                 .bind(&event.creator_id)
+                .bind(reliability_score)
                 .execute(&pool)
                 .await;
 
             match update_result {
                 Ok(_) => {
-                    tracing::info!("Creator reputation updated for {}", event.creator_id);
+                    tracing::info!("Creator reputation updated for {} (reliability: {:.2})", 
+                        event.creator_id, reliability_score);
                     Ok(())
                 }
                 Err(e) => {
@@ -390,6 +398,9 @@ pub async fn fetch_creator_reputation_from_db(creator_id: &str) -> ReputationAgg
 
     let result = sqlx::query_as::<_, (Option<f64>, i32, i32, i32, i32, i32, i32, bool, Option<f64>)>(
         r#"
+        SELECT average_rating, total_reviews, stars_5, stars_4, stars_3, stars_2, stars_1, is_verified, reliability_score
+        FROM creator_reputation 
+        WHERE creator_id = $1
         SELECT average_rating::float8, total_reviews, stars_5, stars_4, stars_3, stars_2, stars_1, is_verified, reliability_score::float8
         FROM creator_reputation WHERE creator_id = $1
         "#
