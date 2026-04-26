@@ -76,7 +76,7 @@ pub fn setup_metrics() -> (actix_web_prom::PrometheusMetrics, BusinessMetrics) {
         .build()
         .expect("failed to build Prometheus metrics middleware");
 
-    let business = BusinessMetrics::new(prometheus.registry.as_ref());
+    let business = BusinessMetrics::new(&prometheus.registry);
 
     (prometheus, business)
 }

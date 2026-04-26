@@ -1,102 +1,52 @@
-use actix_web::{middleware, web, App, HttpResponse, HttpServer};
-use deadpool_redis::{redis::AsyncCommands, Config as RedisConfig, Pool as RedisPool, Runtime};
-use serde::{Deserialize, Serialize};
-mod metrics;
-
-use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{runtime, trace::{self, TracerProvider}, Resource};
-use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
-
 use actix_cors::Cors;
 use actix_web::{
-    dev::Server, http::StatusCode, middleware, web, App, HttpResponse, HttpServer, ResponseError,
+    dev::Server, http::StatusCode, web, App, HttpRequest, HttpResponse, HttpServer,
+    ResponseError,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::{pending, Future};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
-use actix_web::{http::StatusCode, middleware, web, App, HttpResponse, HttpServer, ResponseError};
+use actix_web::middleware::{Compress, Logger, NormalizePath};
+use chrono::{DateTime, Utc};
 use deadpool_redis::{redis::AsyncCommands, Config, Pool, Runtime};
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{runtime, trace::{self, TracerProvider}, Resource};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use std::collections::HashMap;
+use std::future::{pending, Future};
+use std::net::TcpListener;
+use std::sync::Arc;
 use stellar_discovery::{create_discovery, ServiceInfo};
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
-pub mod middleware;
-use middleware::{AuthMiddleware, AuthMiddlewareInner};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccessClaims {
-    pub sub: String,
-    pub family_id: uuid::Uuid,
-    pub exp: i64,
-    pub iat: i64,
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum AuthError {
-    #[error("Missing or invalid Authorization header")]
-    MissingHeader,
-    #[error("Invalid JWT token")]
-    InvalidToken(#[from] jsonwebtoken::errors::Error),
-}
-
-impl actix_web::ResponseError for AuthError {
-    fn error_response(&self) -> HttpResponse {
-        let response: ApiResponse<serde_json::Value> = ApiResponse::err(self.to_string());
-        HttpResponse::Unauthorized().json(response)
-    }
-}
-
-async fn get_claims(req: &actix_web::HttpRequest) -> Result<AccessClaims, AuthError> {
-    let token = req.headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or(AuthError::MissingHeader)?;
-
-    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-    let mut validation = Validation::default();
-    validation.validate_exp = true;
-    let claims = decode::<AccessClaims>(
-        token,
-        &DecodingKey::from_secret(jwt_secret.as_bytes()),
-        &validation,
-    )?
-    .claims;
-
-    Ok(claims)
-}
-
-use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
-use actix_web::Error;
-use chrono::{DateTime, Utc};
-use jsonwebtoken::{decode, DecodingKey, Validation};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccessClaims {
-    pub sub: String,
-    pub family_id: uuid::Uuid,
-    pub exp: i64,
-    pub iat: i64,
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum AuthError {
-    #[error("Missing or invalid Authorization header")]
-    MissingHeader,
-    #[error("Invalid JWT token")]
-    InvalidToken(#[from] jsonwebtoken::errors::Error),
-}
-
+mod metrics;
 mod webhooks;
+pub mod middleware;
+mod custom_middleware;
 
-// ── Request / Response types ─────────────────────────────────────────────────
+use custom_middleware::{get_request_id, RateLimit, RateLimitConfig, RequestId};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessClaims {
+    pub sub: String,
+    pub family_id: uuid::Uuid,
+    pub exp: i64,
+    pub iat: i64,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum AuthError {
+    #[error("Missing or invalid Authorization header")]
+    MissingHeader,
+    #[error("Invalid JWT token")]
+    InvalidToken(#[from] jsonwebtoken::errors::Error),
+}
+
 impl actix_web::ResponseError for AuthError {
     fn error_response(&self) -> HttpResponse {
         let response: ApiResponse<serde_json::Value> = ApiResponse::err(self.to_string());
@@ -123,6 +73,8 @@ async fn get_claims(req: &actix_web::HttpRequest) -> Result<AccessClaims, AuthEr
 
     Ok(claims)
 }
+
+
 
 #[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 pub struct BountyRequest {
@@ -155,7 +107,6 @@ pub struct FreelancerRegistration {
 }
 
 // Generic envelope — no ToSchema bound so it works with any Serialize T.
-#[derive(Clone, Serialize, Deserialize, Debug)]
 #[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 pub struct ApiResponse<T> {
     pub success: bool,
@@ -178,7 +129,7 @@ impl<T> ApiResponse<T> {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 enum ApiError {
     #[error("Invalid request: {0}")]
     BadRequest(String),
@@ -280,6 +231,27 @@ struct EscrowRecord {
     release_condition: Option<String>,
     created_at: Option<i64>,
     released_at: Option<i64>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
+pub struct ReviewBreakdown {
+    #[serde(rename = "1")]
+    pub one: i64,
+    #[serde(rename = "2")]
+    pub two: i64,
+    #[serde(rename = "3")]
+    pub three: i64,
+    #[serde(rename = "4")]
+    pub four: i64,
+    #[serde(rename = "5")]
+    pub five: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
+pub struct AggregateRating {
+    pub average: f64,
+    pub total: i64,
+    pub breakdown: ReviewBreakdown,
 }
 
 fn value_response<T>(data: &T) -> Result<serde_json::Value, ApiError>
@@ -400,6 +372,7 @@ fn configure_api_routes(cfg: &mut web::ServiceConfig, redis: deadpool_redis::Poo
                         .route("/bounties/{id}", web::get().to(get_bounty))
                         .route("/freelancers", web::get().to(list_freelancers))
                         .route("/freelancers/{address}", web::get().to(get_freelancer))
+                        .route("/creators/{id}/reviews/aggregate", web::get().to(get_review_aggregate))
                         .route("/escrow/{id}", web::get().to(get_escrow)),
                 )
                 // Webhook management
@@ -451,15 +424,19 @@ fn build_http_server(
     listener: TcpListener,
     state: AppState,
     openapi: utoipa::openapi::OpenApi,
+    prometheus: actix_web_prom::PrometheusMetrics,
+    business_metrics: web::Data<metrics::BusinessMetrics>,
 ) -> std::io::Result<Server> {
     Ok(HttpServer::new(move || {
         let redis = state.redis.clone();
         App::new()
             .app_data(web::Data::new(state.clone()))
+            .app_data(business_metrics.clone())
+            .wrap(prometheus.clone())
             .wrap(RequestId)
             .wrap(Cors::permissive())
-            .wrap(middleware::Logger::default())
-            .wrap(middleware::NormalizePath::trim())
+            .wrap(Logger::default())
+            .wrap(NormalizePath::trim())
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
             )
@@ -622,17 +599,6 @@ async fn health(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
         (status = 500, description = "Database error"),
     )
 )]
-async fn create_bounty(redis: web::Data<Pool>, body: web::Json<BountyRequest>) -> HttpResponse {
-    tracing::info!("Creating bounty: {:?}", body.title);
-    let data = serde_json::json!({
-        "bounty_id": 1,
-        "creator": body.creator,
-        "title": body.title,
-        "budget": body.budget,
-        "status": "open"
-    });
-    webhooks::trigger_webhooks(&redis, "bounty.created", data.clone()).await;
-    HttpResponse::Created().json(ApiResponse::ok(data, Some("Bounty created successfully".into())))
 async fn create_bounty(pool: web::Data<PgPool>, body: web::Json<BountyRequest>) -> Result<HttpResponse, ApiError> {
     tracing::info!("Creating bounty: {:?}", body.title);
 
@@ -809,7 +775,6 @@ async fn list_bounties(
         (status = 500, description = "Database error"),
     )
 )]
-async fn get_bounty(redis: web::Data<Pool>, path: web::Path<u64>) -> HttpResponse {
 async fn get_bounty(
     path: web::Path<u64>,
     pool: web::Data<PgPool>,
@@ -822,14 +787,9 @@ async fn get_bounty(
     };
     let cache_key = format!("api:bounty:{bounty_id}");
 
-    if let Ok(mut conn) = redis.get().await {
-        if let Ok(cached) = conn.get::<String, String>(cache_key.clone()).await {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cached) {
-                tracing::debug!("Cache hit for {}", cache_key);
-                return HttpResponse::Ok().json(ApiResponse::ok(parsed, None::<String>));
     match redis.get().await {
         Ok(mut conn) => {
-            match conn.get::<_, String>(&cache_key).await {
+            match conn.get::<String>(&cache_key).await {
                 Ok(payload) => {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&payload) {
                         tracing::debug!("Cache hit for {cache_key}");
@@ -877,14 +837,9 @@ async fn get_bounty(
 
     let data = value_response(&bounty)?;
 
-    if let Ok(mut conn) = redis.get().await {
-        let _: Result<(), _> = conn.set_ex(cache_key, data.to_string(), 60).await;
-    }
-
-    HttpResponse::Ok().json(ApiResponse::ok(data, None::<String>))
     match redis.get().await {
         Ok(mut conn) => {
-            if let Err(error) = conn.set_ex::<_, _, ()>(&cache_key, data.to_string(), 60).await {
+            if let Err(error) = conn.set_ex(&cache_key, data.to_string(), 60).await {
                 tracing::warn!("Redis SETEX failed for key {cache_key}: {error}");
             }
         }
@@ -909,20 +864,8 @@ async fn get_bounty(
     )
 )]
 async fn apply_for_bounty(
-    redis: web::Data<Pool>,
     path: web::Path<u64>,
     body: web::Json<BountyApplication>,
-) -> HttpResponse {
-    let bounty_id = path.into_inner();
-    let data = serde_json::json!({
-        "application_id": 1,
-        "bounty_id": bounty_id,
-        "freelancer": body.freelancer,
-        "status": "pending"
-    });
-    webhooks::trigger_webhooks(&redis, "application.submitted", data.clone()).await;
-    HttpResponse::Created()
-        .json(ApiResponse::ok(data, Some("Application submitted successfully".to_string())))
     pool: web::Data<PgPool>,
 ) -> Result<HttpResponse, ApiError> {
     let bounty_id = match parse_u64_to_i64(path.into_inner(), "id") {
@@ -1004,11 +947,6 @@ async fn apply_for_bounty(
         (status = 500, description = "Database error"),
     )
 )]
-async fn register_freelancer(body: web::Json<FreelancerRegistration>) -> HttpResponse {
-    HttpResponse::Created().json(ApiResponse::ok(
-        serde_json::json!({ "name": body.name, "discipline": body.discipline, "verified": false }),
-        Some("Freelancer registered successfully".to_string()),
-    ))
 async fn register_freelancer(
     body: web::Json<FreelancerRegistration>,
     pool: web::Data<PgPool>,
@@ -1062,7 +1000,8 @@ async fn register_freelancer(
 #[utoipa::path(
     get, path = "/api/v1/freelancers",
     params(
-        PaginationParams,
+        ("page" = Option<i64>, Query, description = "Page number (default 1)"),
+        ("limit" = Option<i64>, Query, description = "Results per page, 1-100 (default 10)"),
         ("discipline" = Option<String>, Query, description = "Filter by discipline"),
     ),
     responses(
@@ -1073,13 +1012,6 @@ async fn register_freelancer(
 async fn list_freelancers(
     req: HttpRequest,
     query: web::Query<std::collections::HashMap<String, String>>,
-    _redis: web::Data<Pool>,
-) -> HttpResponse {
-    let discipline = query.get("discipline").cloned().unwrap_or_default();
-    HttpResponse::Ok().json(ApiResponse::ok(
-        serde_json::json!({ "freelancers": [], "total": 0, "filters": { "discipline": discipline } }),
-        None::<String>,
-    ))
     pool: web::Data<PgPool>,
 ) -> Result<HttpResponse, ApiError> {
     let discipline = query.get("discipline").cloned();
@@ -1152,7 +1084,6 @@ async fn list_freelancers(
         (status = 500, description = "Database error"),
     )
 )]
-async fn get_freelancer(redis: web::Data<Pool>, path: web::Path<String>) -> HttpResponse {
 async fn get_freelancer(
     path: web::Path<String>,
     pool: web::Data<PgPool>,
@@ -1161,14 +1092,9 @@ async fn get_freelancer(
     let address = path.into_inner();
     let cache_key = format!("api:freelancer:{address}");
 
-    if let Ok(mut conn) = redis.get().await {
-        if let Ok(cached) = conn.get::<String, String>(cache_key.clone()).await {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cached) {
-                tracing::debug!("Cache hit for {}", cache_key);
-                return HttpResponse::Ok().json(ApiResponse::ok(parsed, None::<String>));
     match redis.get().await {
         Ok(mut conn) => {
-            match conn.get::<_, String>(&cache_key).await {
+            match conn.get::<String>(&cache_key).await {
                 Ok(payload) => {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&payload) {
                         tracing::debug!("Cache hit for {cache_key}");
@@ -1213,16 +1139,11 @@ async fn get_freelancer(
         }
     };
 
-    if let Ok(mut conn) = redis.get().await {
-        let _: Result<(), _> = conn.set_ex(cache_key, data.to_string(), 60).await;
-    }
-
-    HttpResponse::Ok().json(ApiResponse::ok(data, None::<String>))
     let data = value_response(&freelancer)?;
 
     match redis.get().await {
         Ok(mut conn) => {
-            if let Err(error) = conn.set_ex::<_, _, ()>(&cache_key, data.to_string(), 60).await {
+            if let Err(error) = conn.set_ex(&cache_key, data.to_string(), 60).await {
                 tracing::warn!("Redis SETEX failed for key {cache_key}: {error}");
             }
         }
@@ -1232,6 +1153,69 @@ async fn get_freelancer(
     }
 
     Ok(HttpResponse::Ok().json(ApiResponse::ok(data, None)))
+}
+
+/// Get aggregated review rating for a creator
+#[utoipa::path(
+    get, path = "/api/v1/creators/{id}/reviews/aggregate",
+    params(("id" = String, Path, description = "Creator ID")),
+    responses(
+        (status = 200, description = "Aggregated rating"),
+        (status = 500, description = "Database error"),
+    )
+)]
+async fn get_review_aggregate(
+    path: web::Path<String>,
+    pool: web::Data<PgPool>,
+) -> Result<HttpResponse, ApiError> {
+    let creator_id = path.into_inner();
+
+    #[derive(FromRow)]
+    struct ReviewAggRow {
+        total: i64,
+        average: f64,
+        count_1: i64,
+        count_2: i64,
+        count_3: i64,
+        count_4: i64,
+        count_5: i64,
+    }
+
+    let row = sqlx::query_as::<_, ReviewAggRow>(
+        r#"
+        SELECT
+            COUNT(*)::BIGINT as total,
+            COALESCE(AVG(rating), 0)::DOUBLE PRECISION as average,
+            COUNT(CASE WHEN rating = 1 THEN 1 END)::BIGINT as count_1,
+            COUNT(CASE WHEN rating = 2 THEN 1 END)::BIGINT as count_2,
+            COUNT(CASE WHEN rating = 3 THEN 1 END)::BIGINT as count_3,
+            COUNT(CASE WHEN rating = 4 THEN 1 END)::BIGINT as count_4,
+            COUNT(CASE WHEN rating = 5 THEN 1 END)::BIGINT as count_5
+        FROM "Review"
+        WHERE "creatorId" = $1 AND status = 'APPROVED'
+        "#,
+    )
+    .bind(&creator_id)
+    .fetch_one(pool.get_ref())
+    .await
+    .map_err(|error| {
+        tracing::error!("Failed to fetch review aggregate for creator {creator_id}: {error}");
+        ApiError::Database(error)
+    })?;
+
+    let aggregate = AggregateRating {
+        average: (row.average * 10.0).round() / 10.0,
+        total: row.total,
+        breakdown: ReviewBreakdown {
+            one: row.count_1,
+            two: row.count_2,
+            three: row.count_3,
+            four: row.count_4,
+            five: row.count_5,
+        }
+    };
+
+    Ok(HttpResponse::Ok().json(ApiResponse::ok(aggregate, None)))
 }
 
 /// Get escrow details
@@ -1244,12 +1228,6 @@ async fn get_freelancer(
         (status = 500, description = "Database error"),
     )
 )]
-async fn get_escrow(path: web::Path<u64>) -> HttpResponse {
-    let escrow_id = path.into_inner();
-    HttpResponse::Ok().json(ApiResponse::ok(
-        serde_json::json!({ "id": escrow_id, "status": "active", "amount": 0 }),
-        None::<String>,
-    ))
 async fn get_escrow(path: web::Path<u64>, pool: web::Data<PgPool>) -> Result<HttpResponse, ApiError> {
     let escrow_id = match parse_u64_to_i64(path.into_inner(), "id") {
         Ok(value) => value,
@@ -1299,13 +1277,6 @@ async fn get_escrow(path: web::Path<u64>, pool: web::Data<PgPool>) -> Result<Htt
         (status = 500, description = "Database error"),
     )
 )]
-async fn release_escrow(redis: web::Data<Pool>, path: web::Path<u64>) -> HttpResponse {
-    let escrow_id = path.into_inner();
-    let data = serde_json::json!({ "id": escrow_id, "status": "released" });
-    webhooks::trigger_webhooks(&redis, "escrow.released", data.clone()).await;
-    HttpResponse::Ok()
-        .json(ApiResponse::ok(data, Some("Funds released successfully".to_string())))
-}
 async fn release_escrow(path: web::Path<u64>, pool: web::Data<PgPool>) -> Result<HttpResponse, ApiError> {
     let escrow_id = match parse_u64_to_i64(path.into_inner(), "id") {
         Ok(value) => value,
@@ -1413,7 +1384,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     // Initialize OpenTelemetry
-    let tracer_provider = opentelemetry_otlp::new_pipeline()
+    let tracer = opentelemetry_otlp::new_pipeline()
         .tracing()
         .with_exporter(
             opentelemetry_otlp::new_exporter()
@@ -1429,7 +1400,6 @@ async fn main() -> anyhow::Result<()> {
         .install_batch(runtime::Tokio)
         .expect("Failed to initialize tracer");
 
-    let tracer = tracer_provider.tracer("stellar-api");
     let telemetry = OpenTelemetryLayer::new(tracer);
     
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1478,13 +1448,10 @@ async fn main() -> anyhow::Result<()> {
         freelancer_contract_id,
     };
 
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let cfg = RedisConfig::from_url(redis_url);
-    let redis_pool = cfg.create_pool(Some(Runtime::Tokio1)).expect("Failed to create Redis pool");
     let openapi = ApiDoc::openapi();
 
     let (prometheus, business_metrics) = metrics::setup_metrics();
-    let business_metrics = web::Data::new(business_metrics);
+    let business_metrics_data = web::Data::new(business_metrics);
 
     tracing::info!("Starting Stellar API on {}:{}", host, port);
     tracing::info!(
@@ -1495,64 +1462,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Prometheus metrics available at http://{}:{}/metrics", host, port);
 
     let listener = TcpListener::bind((host.as_str(), port))?;
-    build_http_server(listener, state, openapi)?.await?;
+    build_http_server(listener, state, openapi, prometheus, business_metrics_data)?.await?;
     tracing::info!("Stellar API shutdown complete");
     Ok(())
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(db_pool.clone()))
-            .app_data(web::Data::new(redis_pool.clone()))
-            .app_data(business_metrics.clone())
-            .wrap(prometheus.clone())
-            .wrap(Cors::permissive())
-            .wrap(tracing_actix_web::TracingLogger::default())
-            .wrap(middleware::Compress::default())
-            .wrap(middleware::Logger::default())
-            .wrap(middleware::NormalizePath::trim())
-            .service(
-                SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
-            )
-            .route("/health", web::get().to(health))
-            .route("/api/v1/bounties", web::post().to(create_bounty))
-            .route("/api/v1/bounties", web::get().to(list_bounties))
-            .route("/api/v1/bounties/{id}", web::get().to(get_bounty))
-            .route("/api/v1/bounties/{id}/apply", web::post().to(apply_for_bounty))
-            .route("/api/v1/freelancers/register", web::post().to(register_freelancer))
-            .route("/api/v1/freelancers", web::get().to(list_freelancers))
-            .route("/api/v1/freelancers/{address}", web::get().to(get_freelancer))
-            .route("/api/v1/escrow/{id}", web::get().to(get_escrow))
-            .route("/api/v1/escrow/{id}/release", web::post().to(release_escrow))
-            .route("/api/v1/webhooks", web::post().to(webhooks::register_webhook))
-            .route("/api/v1/webhooks", web::get().to(webhooks::list_webhooks))
-            .route("/api/v1/webhooks/{id}", web::delete().to(webhooks::delete_webhook))
-            // ── File upload routes ───────────────────────────────────────
-            .route("/api/v1/upload/avatar", web::post().to(upload::upload_avatar))
-            .route("/api/v1/upload/project-image", web::post().to(upload::upload_project_image))
-            .route("/api/v1/upload/bounty-attachment", web::post().to(upload::upload_bounty_attachment))
-            .route("/api/v1/uploads", web::get().to(upload::list_uploads))
-            .route("/api/v1/uploads/{category}/{filename}", web::get().to(upload::serve_upload))
-            .route("/api/v1/uploads/{id}", web::delete().to(upload::delete_upload))
-            // ── Backward-compat redirects: /api/* → /api/v1/* ───────────
-            .route("/api/bounties",              web::get().to(redirect_to_v1))
-            .route("/api/bounties",              web::post().to(redirect_to_v1))
-            .route("/api/bounties/{tail:.*}",    web::route().to(redirect_to_v1))
-            .route("/api/freelancers",           web::get().to(redirect_to_v1))
-            .route("/api/freelancers/{tail:.*}", web::route().to(redirect_to_v1))
-            .route("/api/escrow/{tail:.*}",      web::route().to(redirect_to_v1))
-            .route("/api/webhooks",              web::get().to(redirect_to_v1))
-            .route("/api/webhooks",              web::post().to(redirect_to_v1))
-            .route("/api/webhooks/{tail:.*}",    web::route().to(redirect_to_v1))
-    })
-    .bind((config.api_host.as_str(), config.api_port))?
-    .run()
-    .await;
-
-    // Deregister from service discovery on shutdown
-    if let Err(e) = discovery.deregister(&service_id).await {
-        tracing::warn!("Service discovery deregistration failed: {e}");
-    }
-
-    server
 }
 
 #[cfg(test)]
@@ -1620,6 +1532,39 @@ mod tests {
             ApiError::ContractInvocation("x".to_string()).status_code(),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    #[test]
+    fn review_breakdown_serialization_uses_numeric_keys() {
+        let breakdown = ReviewBreakdown {
+            one: 1,
+            two: 2,
+            three: 3,
+            four: 4,
+            five: 5,
+        };
+        let json = serde_json::to_string(&breakdown).unwrap();
+        assert!(json.contains("\"1\":1"));
+        assert!(json.contains("\"2\":2"));
+        assert!(json.contains("\"3\":3"));
+        assert!(json.contains("\"4\":4"));
+        assert!(json.contains("\"5\":5"));
+    }
+
+    #[test]
+    fn aggregate_rating_rounding_logic() {
+        let test_cases = vec![
+            (4.55, 4.6),
+            (4.54, 4.5),
+            (4.0, 4.0),
+            (0.0, 0.0),
+            (5.0, 5.0),
+        ];
+
+        for (input, expected) in test_cases {
+            let rounded = (input * 10.0).round() / 10.0;
+            assert_eq!(rounded, expected, "failed for input {input}");
+        }
     }
 
     #[actix_web::test]

@@ -77,9 +77,28 @@ export async function GET(request: NextRequest) {
 
   const { reviews, total } = getReviewsForCreator(creatorId, { sort, filterRating, page, limit })
 
-  // Calculate aggregate from all approved reviews (not just current page)
-  const { reviews: allReviews } = getReviewsForCreator(creatorId, { limit: 1000 })
-  const aggregate = calculateAggregate(allReviews)
+  // Calculate aggregate from Rust backend
+  let aggregate = {
+    average: 0,
+    total: 0,
+    breakdown: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+  };
+
+  try {
+    const backendUrl = process.env.RUST_API_URL || 'http://localhost:3001';
+    const res = await fetch(`${backendUrl}/api/v1/creators/${creatorId}/reviews/aggregate`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && data.data) {
+        aggregate = data.data;
+      }
+    }
+  } catch (error) {
+    console.error("Failed to fetch aggregate from Rust backend:", error);
+    // fallback to mock calculateAggregate if rust backend is not running
+    const { reviews: allReviews } = getReviewsForCreator(creatorId, { limit: 1000 })
+    aggregate = calculateAggregate(allReviews)
+  }
 
   return NextResponse.json({
     reviews,
