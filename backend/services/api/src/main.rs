@@ -5,18 +5,110 @@ use actix_web::{http, middleware, web, App, HttpResponse, HttpServer};
 use futures::future::{ok, Ready};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
+use std::time::Duration;
 
 mod alerts;
+mod aggregation;
 mod analytics;
 mod auth;
 mod database;
 mod event_indexer;
+mod ml;
+mod ml_handlers;
 mod reputation;
 mod verification_rewards;
 mod webhook;
+mod websocket;
 
 pub const API_VERSION: &str = "1";
 pub const API_PREFIX: &str = "/api/v1";
+
+// ==================== Startup Configuration ====================
+
+fn parse_u16_env_with_range(name: &str, default: u16, min: u16, max: u16) -> u16 {
+    let raw = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let parsed = raw.parse::<u16>().unwrap_or_else(|_| {
+        panic!(
+            "{} must be a valid unsigned 16-bit integer, got '{}'",
+            name, raw
+        )
+    });
+
+    if !(min..=max).contains(&parsed) {
+        panic!(
+            "{} must be between {} and {} (inclusive), got {}",
+            name, min, max, parsed
+        );
+    }
+
+    parsed
+}
+
+fn parse_u32_env_with_range(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    let raw = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let parsed = raw.parse::<u32>().unwrap_or_else(|_| {
+        panic!(
+            "{} must be a valid unsigned 32-bit integer, got '{}'",
+            name, raw
+        )
+    });
+
+    if !(min..=max).contains(&parsed) {
+        panic!(
+            "{} must be between {} and {} (inclusive), got {}",
+            name, min, max, parsed
+        );
+    }
+
+    parsed
+}
+
+fn parse_u64_env_with_range(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    let raw = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let parsed = raw.parse::<u64>().unwrap_or_else(|_| {
+        panic!(
+            "{} must be a valid unsigned 64-bit integer, got '{}'",
+            name, raw
+        )
+    });
+
+    if !(min..=max).contains(&parsed) {
+        panic!(
+            "{} must be between {} and {} (inclusive), got {}",
+            name, min, max, parsed
+        );
+    }
+
+    parsed
+}
+
+fn parse_u32_env_with_range_alias(
+    primary_name: &str,
+    legacy_name: &str,
+    default: u32,
+    min: u32,
+    max: u32,
+) -> u32 {
+    let raw = std::env::var(primary_name)
+        .or_else(|_| std::env::var(legacy_name))
+        .unwrap_or_else(|_| default.to_string());
+
+    let parsed = raw.parse::<u32>().unwrap_or_else(|_| {
+        panic!(
+            "{} (or legacy {}) must be a valid unsigned 32-bit integer, got '{}'",
+            primary_name, legacy_name, raw
+        )
+    });
+
+    if !(min..=max).contains(&parsed) {
+        panic!(
+            "{} (or legacy {}) must be between {} and {} (inclusive), got {}",
+            primary_name, legacy_name, min, max, parsed
+        );
+    }
+
+    parsed
+}
 
 // ==================== Domain Models ====================
 
@@ -253,13 +345,63 @@ pub struct CreatorStats {
 // ==================== Routes ====================
 
 /// Health check endpoint
-async fn health() -> HttpResponse {
-    HttpResponse::Ok()
+async fn health(
+    pool: web::Data<PgPool>,
+    rpc_url: web::Data<String>,
+) -> HttpResponse {
+    let mut db_connected = false;
+    let mut rpc_connected = false;
+
+    // Verify database connection
+    match pool.acquire().await {
+        Ok(_) => {
+            db_connected = true;
+        }
+        Err(e) => {
+            tracing::error!("Database health check failed: {}", e);
+        }
+    }
+
+    // Verify Stellar RPC connectivity
+    // We perform a simple reachability check. In a real scenario, 
+    // we might call a method like 'getNetwork' or 'getHealth'.
+    let client = reqwest::Client::new();
+    match client.get(rpc_url.get_ref()).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() || resp.status().as_u16() == 405 {
+                // 405 Method Not Allowed is acceptable for a GET on a JSON-RPC endpoint
+                rpc_connected = true;
+            }
+        }
+        Err(e) => {
+            tracing::error!("Stellar RPC health check failed: {}", e);
+        }
+    }
+
+    let status = if db_connected && rpc_connected {
+        "healthy"
+    } else if db_connected || rpc_connected {
+        "degraded"
+    } else {
+        "unhealthy"
+    };
+
+    let response_code = if db_connected && rpc_connected {
+        HttpResponse::Ok()
+    } else {
+        HttpResponse::ServiceUnavailable()
+    };
+
+    response_code
         .content_type("application/json")
         .json(serde_json::json!({
-            "status": "healthy",
+            "status": status,
             "service": "stellar-api",
-            "version": "0.1.0"
+            "version": "0.1.0",
+            "dependencies": {
+                "database": if db_connected { "connected" } else { "disconnected" },
+                "stellar_rpc": if rpc_connected { "connected" } else { "disconnected" }
+            }
         }))
 }
 
@@ -740,12 +882,8 @@ async fn list_reviews_filtered(
 /// Submit a review after bounty completion.
 async fn submit_review(
     body: web::Json<ReviewSubmission>,
-    pool: web::Data<PgPool>,
 ) -> HttpResponse {
     tracing::info!("Submitting review for creator: {}", body.creator_id);
-
-    // Set the database pool for reputation operations
-    reputation::set_database_pool(pool.get_ref().clone());
 
     let mut field_errors: Vec<FieldError> = Vec::new();
     if body.bounty_id.trim().is_empty() {
@@ -939,13 +1077,13 @@ async fn create_escrow(body: web::Json<database::EscrowCreateRequest>) -> HttpRe
 
     let escrow = database::create_escrow(body.into_inner());
     let response: ApiResponse<serde_json::Value> = ApiResponse::ok(
-        serde_json::json!(
+        serde_json::json!({
             "escrowId": escrow.id.to_string(),
             "txHash": escrow.transaction_hash,
             "operation": "deposit",
             "status": escrow.status,
             "timestamp": escrow.created_at
-        ),
+        }),
         Some("Escrow created successfully".to_string()),
     );
 
@@ -1160,21 +1298,71 @@ pub fn cors_middleware() -> Cors {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Attempt to load .env file as early as possible
+    let dotenv_result = dotenvy::dotenv();
+
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter("info,stellar_api=debug")
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info,stellar_api=debug".to_string()))
         .init();
 
+    // Log the result of loading .env now that tracing is initialized
+    match dotenv_result {
+        Ok(path) => tracing::info!("Environment variables loaded from {:?}", path),
+        Err(e) => tracing::warn!("No .env file found or error loading it: {}", e),
+    }
+
     tracing::info!("Starting Stellar API Server...");
+
+    // Validate required environment variables for production
+    // In a real production environment, we should be strict about these.
+    let required_vars = ["DATABASE_URL", "JWT_SECRET"];
+    let mut missing_vars = Vec::new();
+    for var in required_vars {
+        if std::env::var(var).is_err() {
+            missing_vars.push(var);
+        }
+    }
+
+    if !missing_vars.is_empty() {
+        let err_msg = format!(
+            "Fatal: Missing required environment variables: {}. Service cannot start.",
+            missing_vars.join(", ")
+        );
+        tracing::error!("{}", err_msg);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, err_msg));
+    }
 
     // Initialize database connection
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://stellar:stellar_dev_password@localhost:5432/stellar_db".to_string());
+    let database_max_connections = parse_u32_env_with_range_alias(
+        "DB_POOL_MAX_CONNECTIONS",
+        "DATABASE_MAX_CONNECTIONS",
+        10,
+        1,
+        100,
+    );
+    let db_pool_idle_timeout_seconds =
+        parse_u64_env_with_range("DB_POOL_IDLE_TIMEOUT", 300, 5, 3_600);
+    let slow_query_threshold_ms =
+        parse_u64_env_with_range("SLOW_QUERY_THRESHOLD_MS", 1_000, 10, 300_000);
     
     tracing::info!("Connecting to database: {}", database_url.replace("stellar_dev_password", "***"));
+    tracing::info!(
+        "DB pool max connections: {}, idle timeout: {}s, slow query threshold: {}ms",
+        database_max_connections,
+        db_pool_idle_timeout_seconds,
+        slow_query_threshold_ms
+    );
     
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(database_max_connections)
+        .idle_timeout(Some(Duration::from_secs(db_pool_idle_timeout_seconds)))
+        .log_slow_statements(
+            tracing::log::LevelFilter::Warn,
+            Duration::from_millis(slow_query_threshold_ms),
+        )
         .connect(&database_url)
         .await
         .expect("Failed to connect to database");
@@ -1191,20 +1379,34 @@ async fn main() -> std::io::Result<()> {
     reputation::initialize_reputation_system_with_db(pool.clone());
     tracing::info!("Reputation system initialized with hooks and database");
 
+    let stellar_rpc_url = std::env::var("STELLAR_RPC_URL")
+        .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
+    tracing::info!("Stellar RPC URL: {}", stellar_rpc_url);
+    // Initialize the ML model (trained on an empty seed; retraining populates it)
+    let ml_state = web::Data::new(ml_handlers::MlAppState {
+        model: std::sync::Arc::new(ml::SimpleMLModel::new(&[])),
+    });
+    tracing::info!("ML model initialised");
+
     let port = std::env::var("API_PORT")
         .unwrap_or_else(|_| "3001".to_string())
         .parse::<u16>()
         .expect("API_PORT must be a valid port number");
+    let port = parse_u16_env_with_range("API_PORT", 3001, 1, 65535);
 
     let host = std::env::var("API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
     tracing::info!("Server starting on {}:{}", host, port);
+    let ws_limiter = websocket::WsConnectionLimiter::from_env();
 
     HttpServer::new(move || {
         let alert_store = web::Data::new(alerts::AlertStore::new());
         App::new()
             .app_data(web::Data::new(pool.clone()))
             .app_data(alert_store)
+            .app_data(web::Data::new(stellar_rpc_url.clone()))
+            .app_data(ml_state.clone())
+            .app_data(web::Data::new(ws_limiter.clone()))
             .wrap(cors_middleware())
             .wrap(middleware::Logger::default())
             .wrap(middleware::NormalizePath::trim())
@@ -1212,6 +1414,8 @@ async fn main() -> std::io::Result<()> {
             // Health check & version discovery (unversioned)
             .route("/health", web::get().to(health))
             .route("/api/versions", web::get().to(api_versions))
+            .route("/ws", web::get().to(websocket::ws_handler))
+            .route("/api/v1/ws/metrics", web::get().to(websocket::websocket_metrics))
             // v1 public read-only routes
             .service(
                 web::scope("/api/v1")
@@ -1233,6 +1437,15 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/webhooks/payment",
                         web::post().to(webhook::payment_webhook),
+                    )
+                    // ML payment endpoints (issue #426)
+                    .route(
+                        "/payments/{id}/status",
+                        web::get().to(ml_handlers::payment_status_update),
+                    )
+                    .route(
+                        "/payments/{id}/stream",
+                        web::get().to(ml_handlers::payment_stream),
                     )
                     // Protected write routes — require valid JWT
                     .service(
@@ -1272,6 +1485,94 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Startup configuration parsing ──────────────────────────────────────────
+
+    #[test]
+    fn parse_u64_env_with_range_uses_default_when_missing() {
+        std::env::remove_var("SLOW_QUERY_THRESHOLD_MS");
+        let value = parse_u64_env_with_range("SLOW_QUERY_THRESHOLD_MS", 1000, 10, 300_000);
+        assert_eq!(value, 1000);
+    }
+
+    #[test]
+    fn parse_u64_env_with_range_accepts_valid_value() {
+        std::env::set_var("SLOW_QUERY_THRESHOLD_MS", "2500");
+        let value = parse_u64_env_with_range("SLOW_QUERY_THRESHOLD_MS", 1000, 10, 300_000);
+        assert_eq!(value, 2500);
+        std::env::remove_var("SLOW_QUERY_THRESHOLD_MS");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be between 10 and 300000")]
+    fn parse_u64_env_with_range_rejects_out_of_range_value() {
+        std::env::set_var("SLOW_QUERY_THRESHOLD_MS", "5");
+        let _ = parse_u64_env_with_range("SLOW_QUERY_THRESHOLD_MS", 1000, 10, 300_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a valid unsigned 64-bit integer")]
+    fn parse_u64_env_with_range_rejects_non_numeric_value() {
+        std::env::set_var("SLOW_QUERY_THRESHOLD_MS", "abc");
+        let _ = parse_u64_env_with_range("SLOW_QUERY_THRESHOLD_MS", 1000, 10, 300_000);
+    }
+
+    #[test]
+    fn parse_u32_env_with_range_accepts_valid_pool_size() {
+        std::env::set_var("DB_POOL_MAX_CONNECTIONS", "25");
+        let value = parse_u32_env_with_range_alias(
+            "DB_POOL_MAX_CONNECTIONS",
+            "DATABASE_MAX_CONNECTIONS",
+            10,
+            1,
+            100,
+        );
+        assert_eq!(value, 25);
+        std::env::remove_var("DB_POOL_MAX_CONNECTIONS");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be between 1 and 100")]
+    fn parse_u32_env_with_range_rejects_invalid_pool_size() {
+        std::env::set_var("DB_POOL_MAX_CONNECTIONS", "0");
+        let _ = parse_u32_env_with_range_alias(
+            "DB_POOL_MAX_CONNECTIONS",
+            "DATABASE_MAX_CONNECTIONS",
+            10,
+            1,
+            100,
+        );
+    }
+
+    #[test]
+    fn parse_u32_env_with_range_alias_uses_legacy_name() {
+        std::env::remove_var("DB_POOL_MAX_CONNECTIONS");
+        std::env::set_var("DATABASE_MAX_CONNECTIONS", "30");
+        let value = parse_u32_env_with_range_alias(
+            "DB_POOL_MAX_CONNECTIONS",
+            "DATABASE_MAX_CONNECTIONS",
+            10,
+            1,
+            100,
+        );
+        assert_eq!(value, 30);
+        std::env::remove_var("DATABASE_MAX_CONNECTIONS");
+    }
+
+    #[test]
+    fn parse_u64_env_with_range_accepts_db_idle_timeout() {
+        std::env::set_var("DB_POOL_IDLE_TIMEOUT", "600");
+        let value = parse_u64_env_with_range("DB_POOL_IDLE_TIMEOUT", 300, 5, 3_600);
+        assert_eq!(value, 600);
+        std::env::remove_var("DB_POOL_IDLE_TIMEOUT");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be between 5 and 3600")]
+    fn parse_u64_env_with_range_rejects_invalid_db_idle_timeout() {
+        std::env::set_var("DB_POOL_IDLE_TIMEOUT", "2");
+        let _ = parse_u64_env_with_range("DB_POOL_IDLE_TIMEOUT", 300, 5, 3_600);
+    }
 
     // ── ApiResponse ───────────────────────────────────────────────────────────
 
@@ -1535,18 +1836,13 @@ mod tests {
     async fn creator_reputation_integration_returns_aggregation() {
         use actix_web::test as awtest;
 
-        let app = awtest::init_service(
-            App::new()
-                .app_data(web::Data::new(create_test_pool()))
-                .route(
-                    "/api/v1/creators/{id}/reputation",
-                    web::get().to(get_creator_reputation),
-                ),
+        let app = awtest::init_service(App::new()
+            .app_data(web::Data::new(create_test_pool()))
+            .route(
+                "/api/v1/creators/{id}/reputation",
+                web::get().to(get_creator_reputation),
+            )
         )
-        let app = awtest::init_service(App::new().route(
-            "/api/v1/creators/{id}/reputation",
-            web::get().to(get_creator_reputation),
-        ))
         .await;
 
         let req = awtest::TestRequest::get()
@@ -1596,18 +1892,13 @@ mod tests {
     async fn creator_reputation_unknown_id_returns_empty_aggregation() {
         use actix_web::test as awtest;
 
-        let app = awtest::init_service(
-            App::new()
-                .app_data(web::Data::new(create_test_pool()))
-                .route(
-                    "/api/v1/creators/{id}/reputation",
-                    web::get().to(get_creator_reputation),
-                ),
+        let app = awtest::init_service(App::new()
+            .app_data(web::Data::new(create_test_pool()))
+            .route(
+                "/api/v1/creators/{id}/reputation",
+                web::get().to(get_creator_reputation),
+            )
         )
-        let app = awtest::init_service(App::new().route(
-            "/api/v1/creators/{id}/reputation",
-            web::get().to(get_creator_reputation),
-        ))
         .await;
 
         let req = awtest::TestRequest::get()
@@ -1673,15 +1964,6 @@ mod tests {
                 .route("/escrow/create", web::post().to(create_escrow))
                 .route("/escrow/{id}/release", web::post().to(release_escrow))
                 .route("/escrow/{id}/refund", web::post().to(refund_escrow))
-                .route("/api/bounties", web::post().to(create_bounty))
-                .route("/api/bounties/{id}/apply", web::post().to(apply_for_bounty))
-                .route(
-                    "/api/freelancers/register",
-                    web::post().to(register_freelancer),
-                )
-                .route("/api/escrow/create", web::post().to(create_escrow))
-                .route("/api/escrow/{id}/release", web::post().to(release_escrow))
-                .route("/api/escrow/{id}/refund", web::post().to(refund_escrow)),
                 .route("/api/v1/bounties", web::post().to(create_bounty))
                 .route("/api/v1/bounties/{id}/apply", web::post().to(apply_for_bounty))
                 .route("/api/v1/freelancers/register", web::post().to(register_freelancer))
@@ -2360,7 +2642,7 @@ mod tests {
                 "amount": 1000,
                 "token": "GUSDC"
             }))
-        let app = awtest::init_service(build_review_filtering_app()).await;
+        .await;
         
         let req = awtest::TestRequest::get()
             .uri("/api/v1/creators/alex-studio/reviews?page=1&limit=2&sortBy=rating&sortOrder=desc")
@@ -2407,7 +2689,7 @@ mod tests {
                 "amount": 2500,
                 "token": "GUSDC"
             }))
-        let app = awtest::init_service(build_review_filtering_app()).await;
+        .await;
         
         let req = awtest::TestRequest::get()
             .uri("/api/v1/creators/alex-studio/reviews?minRating=4&maxRating=5")
@@ -2440,7 +2722,7 @@ mod tests {
                 "amount": 0,
                 "token": ""
             }))
-        let app = awtest::init_service(build_review_filtering_app()).await;
+        .await;
         
         let req = awtest::TestRequest::get()
             .uri("/api/v1/creators/alex-studio/reviews?minRating=6&sortBy=invalid&page=0")
@@ -2472,7 +2754,7 @@ mod tests {
                 "amount": -100,
                 "token": "GUSDC"
             }))
-        let app = awtest::init_service(build_review_filtering_app()).await;
+        .await;
         
         let req = awtest::TestRequest::get()
             .uri("/api/v1/reviews?page=1&limit=5&sortBy=createdAt&sortOrder=desc")
@@ -2537,7 +2819,8 @@ mod tests {
             .uri("/api/v1/escrow/5/refund")
             .insert_header(("Authorization", format!("Bearer {}", token)))
             .set_json(serde_json::json!({ "authorizerAddress": "GPAYER123" }))
-        let app = awtest::init_service(build_review_filtering_app()).await;
+            .to_request();
+        let resp = awtest::call_service(&app, req).await;
         
         let req = awtest::TestRequest::get()
             .uri("/api/v1/reviews?verifiedOnly=true&sortBy=rating&sortOrder=desc")
@@ -2564,10 +2847,6 @@ mod tests {
     async fn list_reviews_filtered_date_range() {
         use actix_web::test as awtest;
         let app = awtest::init_service(build_escrow_app()).await;
-        let req = awtest::TestRequest::post()
-            .uri("/api/v1/escrow/5/refund")
-            .set_json(serde_json::json!({ "authorizerAddress": "" }))
-        let app = awtest::init_service(build_review_filtering_app()).await;
         
         let req = awtest::TestRequest::get()
             .uri("/api/v1/reviews?dateFrom=2025-01-01&dateTo=2025-12-31")
@@ -2611,12 +2890,6 @@ mod tests {
             let created_at = review["createdAt"].as_str().unwrap();
             assert!(created_at >= "2025-01-01" && created_at <= "2025-12-31");
         }
-    }
-        assert_eq!(json["current"], "1");
-        assert!(json["supported"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("1")));
     }
 
     #[actix_web::test]
@@ -2676,14 +2949,5 @@ mod tests {
             .get("x-api-version")
             .expect("x-api-version header must be present");
         assert_eq!(header, API_VERSION);
-    }
-        assert_eq!(json["success"], true);
-        
-        // All returned reviews should be within the date range
-        let reviews = json["data"]["reviews"]["reviews"].as_array().unwrap();
-        for review in reviews {
-            let created_at = review["createdAt"].as_str().unwrap();
-            assert!(created_at >= "2025-01-01" && created_at <= "2025-12-31");
-        }
     }
 }
